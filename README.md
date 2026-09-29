@@ -101,3 +101,28 @@ Verifies:
 - Automated missed due date catchup and transaction generation
 - Savings plan metrics, feasibility detection, and surplus tracking
 - Atomic disk save and recovery
+- Cloud sync backoff and Last-Write-Wins conflict resolution
+
+---
+
+## 📱 Part 2: iPhone Access via Web App (PWA)
+
+In addition to the Windows desktop app, the project includes an installable mobile PWA inside `web/` designed for iPhone Safari ("Add to Home Screen").
+
+- **Shared Supabase Cloud Backend**: Syncs bank ledgers, subscriptions, and savings plans in real-time with the desktop app.
+- **Mobile-First UX**: Thumb-reachable bottom tab bar, stacked transaction cards with running balances, and tap-to-edit sheet modals.
+- **Offline First**: Uses IndexedDB and Service Worker stale-while-revalidate caching to load and edit offline.
+- **Web Push Notifications**: iOS Safari push alerts for savings plan deadlines via Supabase Edge Function.
+
+To run the web app:
+```bash
+cd web
+npm install
+npm run dev
+```
+
+To run web unit tests:
+```bash
+cd web
+npm test
+```

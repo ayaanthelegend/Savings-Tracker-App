@@ -1,25 +1,54 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod auth;
 mod ledger;
 mod models;
 mod notification;
 mod savings;
 mod storage;
 mod subscriptions;
+mod sync;
 mod ui;
 
 use ui::theme::Theme;
 use ui::SavingsTrackerApp;
 
+#[cfg(windows)]
+#[link(name = "resource")]
+extern "C" {}
+
+
+fn load_app_icon() -> Option<egui::IconData> {
+    let icon_bytes = include_bytes!("../assets/icon.png");
+    if let Ok(img) = image::load_from_memory(icon_bytes) {
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        Some(egui::IconData {
+            rgba: rgba.into_raw(),
+            width,
+            height,
+        })
+    } else {
+        None
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Savings Tracker")
+        .with_inner_size([1180.0, 760.0])
+        .with_min_inner_size([800.0, 520.0])
+        .with_active(true);
+
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Savings Tracker")
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([800.0, 520.0])
-            .with_active(true),
+        viewport,
         ..Default::default()
     };
+
 
     eframe::run_native(
         "Savings Tracker",

@@ -9,47 +9,71 @@
     <description>
       A high-performance, standalone Windows desktop application for personal finance management,
       featuring multi-card bank ledgers with running balances, recurring subscription tracking with
-      automated due-date catchup, savings plans with feasibility metrics, and native Windows toast notifications.
+      automated due-date catchup, savings plans with feasibility metrics, native Windows toast notifications,
+      an interactive overview dashboard with visual charts, and multi-device cloud synchronization powered
+      by Supabase (PostgREST + GoTrue Auth) with offline-first local persistence.
     </description>
     <entry_point>src/main.rs</entry_point>
     <target_binary>target/release/savings_tracker.exe</target_binary>
     <ui_framework>egui / eframe (v0.29)</ui_framework>
+    <cloud_backend>Supabase (PostgreSQL 17, PostgREST 12, GoTrue Auth)</cloud_backend>
   </metadata>
 
   <dependencies>
     <dependency name="eframe" version="0.29">Immediate-mode desktop GUI framework runner</dependency>
     <dependency name="egui" version="0.29">Immediate-mode graphical user interface library</dependency>
     <dependency name="egui_extras" version="0.29" features="all_loaders">Advanced UI controls including TableBuilder for spreadsheets</dependency>
+    <dependency name="egui_plot" version="0.29">Immediate-mode 2D plotting library for trendlines and financial charts</dependency>
     <dependency name="serde" version="1.0" features="derive">Serialization and deserialization framework</dependency>
-    <dependency name="serde_json" version="1.0">JSON storage serialization</dependency>
+    <dependency name="serde_json" version="1.0">JSON storage and REST payload serialization</dependency>
     <dependency name="chrono" version="0.4" features="serde">Date and time arithmetic and calendar calculations</dependency>
-    <dependency name="uuid" version="1.10" features="v4, serde">Unique entity identification</dependency>
+    <dependency name="uuid" version="1.10" features="v4, serde">Unique entity identification across devices</dependency>
     <dependency name="dirs" version="5.0">Standard operating system directory paths resolution</dependency>
     <dependency name="anyhow" version="1.0">Idiomatic error handling and context propagation</dependency>
     <dependency name="windows" version="0.58" features="Data_Xml_Dom, UI_Notifications">
       Native Windows Runtime (WinRT) APIs for interactive OS toast notifications
     </dependency>
+    <dependency name="reqwest" version="0.12" features="json, rustls-tls, blocking">
+      HTTP/REST client with Rustls for secure TLS communication with Supabase endpoints on Windows
+    </dependency>
   </dependencies>
 
   <architecture>
-    <pattern>Immediate Mode GUI (IMGUI)</pattern>
+    <pattern>Immediate Mode GUI (IMGUI) + Offline-First Asynchronous Cloud Sync</pattern>
     <overview>
       Built around an immediate-mode UI paradigm where state is rendered and updated synchronously on every frame.
-      State modifications trigger atomic disk persistence. The ledger engine computes running balances on demand
-      from opening balances and chronological transactions, preventing state drift.
+      Local persistence to %APPDATA%\SavingsTracker\data.json is fast and atomic (write-to-temp-and-rename).
+      Mutations trigger non-blocking asynchronous pushes to Supabase PostgREST. Incoming changes are pulled
+      periodically (every 60s while focused, and immediately on window focus regain) and merged using last-write-wins
+      conflict resolution by updated_at (server wins on exact ties). Soft-deletes propagate via deleted_at timestamps.
     </overview>
     <key_subsystems>
       <subsystem name="Storage Layer">
         Silent, atomic JSON persistence to %APPDATA%\SavingsTracker\data.json using write-to-temp-and-rename semantics.
+        Automatically guarantees that missing sync fields (id, updated_at, deleted_at, category defaults) are populated.
+      </subsystem>
+      <subsystem name="Cloud Sync Subsystem">
+        Dual-channel background worker (src/sync.rs) coordinating PostgREST HTTP operations. Maintains per-table watermarks
+        (sync_watermarks.json), an offline retry queue (pending_sync.json), and exponential backoff (2s to 60s, max 10 retries).
+        Implements last-write-wins conflict resolution and soft deletes (deleted_at).
+      </subsystem>
+      <subsystem name="Authentication Subsystem">
+        GoTrue authentication manager (src/auth.rs) managing login, registration, and session token storage in session.json.
+        Proactively refreshes access tokens when less than 5 minutes of validity remain, preventing sync disruption.
       </subsystem>
       <subsystem name="Ledger Engine">
         Chronological ordering and running balance computation with dynamic filtering (period, category, text search).
+        Filters out soft-deleted records and updates timestamps on mutation.
       </subsystem>
       <subsystem name="Subscription Catchup Engine">
         Automated time-travel catchup: advances overdue subscriptions and posts matching Money Out transactions when app launches.
       </subsystem>
       <subsystem name="Savings Engine">
         Surplus evaluation, income vs expense feasibility calculations, overspending deduction, and deadline monitoring.
+      </subsystem>
+      <subsystem name="Overview Dashboard">
+        Visual financial dashboard (src/ui/overview.rs) featuring 30-day net worth sparkline, 12-month projected subscription
+        commitments, category spend breakdown, and active savings plan progress cards.
       </subsystem>
       <subsystem name="Notification Subsystem">
         Dual-layer Windows notification pipeline (primary: Windows Runtime WinRT COM APIs; fallback: headless PowerShell script).
@@ -61,12 +85,14 @@
   </architecture>
 
   <directory_structure>
-    <entry type="directory" path="src">Source code for core engine, models, and UI</entry>
-    <entry type="directory" path="src/ui">User interface components, view controllers, and styling theme</entry>
+    <entry type="directory" path="src">Source code for core engine, models, sync, auth, and UI</entry>
+    <entry type="directory" path="src/ui">User interface views, login controller, overview dashboard, and styling theme</entry>
     <entry type="directory" path="assets/fonts">Embedded TTF font binaries (SpaceGrotesk, Inter, IBMPlexMono)</entry>
-    <entry type="directory" path="tests">Integration and unit tests verifying domain engines</entry>
+    <entry type="directory" path="tests">Integration and unit tests verifying core domain, sync, and redesign logic</entry>
+    <entry type="directory" path="supabase">PostgreSQL DDL schema, triggers, RLS policies, and documentation</entry>
     <entry type="file" path="Cargo.toml">Cargo package configuration, profiles, and dependencies</entry>
     <entry type="file" path="README.md">Project overview, build instructions, and design documentation</entry>
+    <entry type="file" path="codebase_summary.xml">Machine-readable architectural specification and module index</entry>
   </directory_structure>
 
   <modules>
@@ -75,7 +101,7 @@
       <description>
         Sets up Windows subsystem flags to hide the console terminal in release builds. Initializes the eframe window,
         registers custom font definitions, defines text style font-size mappings, configures dark visuals, and boots
-        SavingsTrackerApp.
+        SavingsTrackerApp with integrated authentication and sync worker threads.
       </description>
       <functions>
         <function name="main">Entry point configuring NativeOptions, FontDefinitions, and running eframe::run_native.</function>
@@ -85,16 +111,22 @@
     <module file="src/models.rs">
       <role>Domain Entities and Data Structures</role>
       <description>
-        Defines all core business entities serialized to JSON. Includes default seed data for fresh installations.
+        Defines all core business entities serialized to local JSON and synced to Supabase. Every entity contains
+        id (UUID), updated_at (DateTime&lt;Utc&gt;), and deleted_at (Option&lt;DateTime&lt;Utc&gt;&gt;) with serde defaults
+        for backwards compatibility with pre-sync data.
       </description>
       <types>
-        <type name="Card">Bank/credit card account with UUID, name, is_primary flag, and opening balance.</type>
-        <type name="Transaction">Income or expense record with card ID, date, category, amount, and auto_generated tag.</type>
-        <type name="BillingCycle">Enum for recurrence: Monthly, Yearly, CustomDays(u32).</type>
-        <type name="Subscription">Recurring cost item linked to a card with next due date and pause status.</type>
-        <type name="SavingsPlan">Financial goal with target, deadline, income, spending limits, and completion status.</type>
+        <type name="Card">Bank/credit card account with UUID, name, is_primary flag, opening balance, and sync timestamps.</type>
+        <type name="Transaction">Income or expense record with card ID, date, category, amount, auto_generated flag, and sync timestamps.</type>
+        <type name="BillingCycle">Enum for recurrence: Monthly, Yearly, CustomDays(u32), with string serialization helpers.</type>
+        <type name="Subscription">Recurring cost item linked to a card with next due date, pause status, and sync timestamps.</type>
+        <type name="SavingsPlan">Financial goal with target, deadline, income, spending limits, deduct_overspending, and sync timestamps.</type>
+        <type name="Category">Custom budget category with UUID, name, is_default, and sync timestamps.</type>
         <type name="AppData">Root application state containing cards, transactions, subscriptions, plans, and categories.</type>
       </types>
+      <methods>
+        <method name="ensure_sync_fields">Iterates over all entities in AppData to assign UUIDs and timestamps to pre-existing rows.</method>
+      </methods>
     </module>
 
     <module file="src/storage.rs">
@@ -108,8 +140,53 @@
       </structs>
       <methods>
         <method name="new">Resolves app data path and creates directory if missing.</method>
-        <method name="load">Reads data.json or seeds default data if file is absent or corrupted.</method>
+        <method name="load">Reads data.json or seeds default data if file is absent or corrupted, running ensure_sync_fields.</method>
         <method name="save">Serializes pretty JSON to a .tmp file, flushes to disk, and atomically renames to target.</method>
+      </methods>
+    </module>
+
+    <module file="src/auth.rs">
+      <role>Authentication and Session Management</role>
+      <description>
+        Connects to Supabase GoTrue Auth endpoints (/auth/v1/token, /auth/v1/signup). Manages access and refresh tokens,
+        persists session data to %APPDATA%\SavingsTracker\session.json, loads project config from config.json, and handles
+        proactive token refresh when tokens near expiration.
+      </description>
+      <structs>
+        <struct name="SupabaseConfig">Holds project URL and anon API key.</struct>
+        <struct name="AuthSession">Holds access token, refresh token, expiry timestamp, and authenticated user ID.</struct>
+        <struct name="AuthManager">Stateless controller handling login, signup, session refresh, and local credential storage.</struct>
+      </structs>
+      <methods>
+        <method name="login">Authenticates with email and password via password grant.</method>
+        <method name="signup">Registers a new account via Supabase auth signup endpoint.</method>
+        <method name="refresh_session">Refreshes expired or expiring access tokens using refresh_token grant.</method>
+        <method name="load_session">Reads cached session from session.json.</method>
+        <method name="save_session">Saves authenticated session to session.json.</method>
+        <method name="clear_session">Deletes stored session file on logout.</method>
+        <method name="load_config">Loads Supabase URL and anon key from config.json or environment variables.</method>
+        <method name="save_config">Persists Supabase URL and anon key to config.json.</method>
+      </methods>
+    </module>
+
+    <module file="src/sync.rs">
+      <role>Asynchronous Cloud Synchronization Engine</role>
+      <description>
+        Manages bi-directional synchronization with Supabase PostgREST. Runs as a background worker with mpsc channels
+        so UI frame rates never stutter. Tracks watermarks per table, queues offline mutations, performs exponential backoff,
+        and executes last-write-wins reconciliation.
+      </description>
+      <structs>
+        <struct name="SyncWatermarks">Per-table timestamp tracking (cards, transactions, subscriptions, savings_plans, categories).</struct>
+        <struct name="PendingSyncQueue">Offline queue persisting unpushed entity IDs across restarts in pending_sync.json.</struct>
+        <struct name="SyncWorker">Background thread executing batch upserts, pulls, and network retries.</struct>
+        <struct name="SyncHandle">Thread-safe interface for the UI to trigger pushes, pulls, and query sync status.</struct>
+      </structs>
+      <methods>
+        <method name="push_all">Enqueues all modified or pending rows to be pushed to Supabase.</method>
+        <method name="pull_changes">Fetches all records modified since last watermark and applies last-write-wins merging.</method>
+        <method name="seed_initial_data">Pushes existing local data to cloud on first login if remote database is empty.</method>
+        <method name="calculate_backoff">Computes exponential backoff delay (2s to 60s, max 10 retries).</method>
       </methods>
     </module>
 
@@ -117,7 +194,7 @@
       <role>Ledger and Running Balance Calculation Engine</role>
       <description>
         Calculates chronological running balances per card starting from opening balance, and filters/sorts ledger rows
-        based on active search queries, categories, and date ranges.
+        based on active search queries, categories, and date ranges. Excludes soft-deleted records.
       </description>
       <structs>
         <struct name="LedgerRow">Renderable table row with money_in, money_out, running_balance, and opening balance flags.</struct>
@@ -130,18 +207,23 @@
     </module>
 
     <module file="src/subscriptions.rs">
-      <role>Subscription Management and Automated Catchup</role>
+      <role>Subscription Management, Automated Catchup, and Sinking Fund Reserves</role>
       <description>
         Calculates prorated monthly costs, advances billing cycles, and automatically catches up missed payment dates
-        by recording Money Out transactions when the application launches.
+        by recording Money Out transactions when the application launches. Provides virtual monthly sinking fund reserve
+        calculations for yearly subscriptions to prevent renewal shock and automatically reserve funds in spending limits.
       </description>
       <structs>
-        <struct name="SubscriptionManager">Stateless helper for cycle math, proration, and due date resolution.</struct>
+        <struct name="YearlyReserveInfo">Calculated sinking fund status for a yearly subscription: monthly_reserve, total_cost, months_remaining, months_accumulated, saved_amount, progress_ratio, and due_text.</struct>
+        <struct name="SubscriptionManager">Stateless helper for cycle math, proration, due date resolution, and annual sinking fund reserves.</struct>
       </structs>
       <methods>
         <method name="advance_date">Calculates the next due date based on Monthly, Yearly, or CustomDays cycle.</method>
         <method name="monthly_cost">Computes normalized monthly cost (divides yearly by 12, scales custom days).</method>
         <method name="total_monthly_cost">Aggregates prorated monthly commitments across all or selected cards.</method>
+        <method name="annual_reserve_monthly_needed">Computes total monthly sinking fund reserve required across all active yearly subscriptions.</method>
+        <method name="yearly_reserve_status">Calculates countdown, accumulated reserve savings, and progress for a yearly subscription.</method>
+        <method name="total_accumulated_annual_reserve">Sums accumulated sinking fund reserves across all active yearly subscriptions.</method>
         <method name="process_due_subscriptions">Loops through overdue active subscriptions, creates ledger expenses, and advances dates.</method>
       </methods>
     </module>
@@ -179,22 +261,52 @@
     </module>
 
     <module file="src/ui/mod.rs">
-      <role>Application Layout and Main Navigation Loop</role>
+      <role>Application Layout, Navigation, and App Lifecycle Loop</role>
       <description>
-        Implements eframe::App. Renders the fixed-width 196px left sidebar with tab buttons, top navigation bar showing
-        net worth across cards and live system date, system notices banner, and delegates central content to the active tab view.
+        Implements eframe::App. Manages the left navigation sidebar with tab buttons (Overview, Accounts, Subscriptions, Savings Plans),
+        top status bar with net worth across accounts and live system date, sync status indicator with manual trigger,
+        login view gatekeeper when unauthenticated, and periodic focus-gated pull sync (every 60s while focused, immediate upon regaining focus).
       </description>
       <types>
-        <type name="AppTab">Enum representing the 3 main views: Accounts, Subscriptions, SavingsPlans.</type>
-        <type name="SavingsTrackerApp">Root application state holding active tab, view states, storage, and notice queue.</type>
+        <type name="AppTab">Enum representing main navigation views: Overview, Accounts, Subscriptions, SavingsPlans.</type>
+        <type name="SavingsTrackerApp">Root application state holding active tab, view states, storage, auth session, and sync worker handle.</type>
       </types>
+    </module>
+
+    <module file="src/ui/login.rs">
+      <role>Login and Account Configuration View Controller</role>
+      <description>
+        Renders centered dark-themed card for user sign-in and registration. Includes collapsible Supabase Project settings
+        drawer (URL and Anon key), input validation, inline feedback banners, and auto-saving of valid credentials to config.json.
+      </description>
+      <structs>
+        <struct name="LoginViewState">Form fields for email, password, Supabase URL, anon key, submission state, and error messages.</struct>
+      </structs>
+      <functions>
+        <function name="render_login_view">Main rendering function returning LoginAction (LoggedIn or None).</function>
+      </functions>
+    </module>
+
+    <module file="src/ui/overview.rs">
+      <role>Overview Dashboard and Visual Analytics View Controller</role>
+      <description>
+        Renders full visual analytics dashboard: 100px hero row with live net worth and 30-day interactive sparkline,
+        financial vitals (monthly income, recurring commitments, average burn, projected net savings), 12-month
+        subscription commitment curve using egui_plot, category spend breakdown, and savings plan pacing cards.
+      </description>
+      <structs>
+        <struct name="OverviewViewState">State controller for interactive dashboard widgets.</struct>
+      </structs>
+      <functions>
+        <function name="render_overview_view">Main rendering entry for the Overview tab.</function>
+      </functions>
     </module>
 
     <module file="src/ui/theme.rs">
       <role>Design System, Color Palette, and Formatting Helpers</role>
       <description>
         Centralized design tokens matching approved dark palette (#11141A background, #171B23 panels, #6C7CF0 accent,
-        #3FCDA8 income, #F2726B expense). Provides font builders and PKR currency formatters with thousands separators.
+        #3FCDA8 income, #F2726B expense). Provides font builders, subtle grid painting, and PKR currency formatters.
       </description>
       <constants>
         <constant name="BG">Primary background color (#11141A)</constant>
@@ -213,6 +325,9 @@
         <method name="format_pkr">Formats monetary amounts with thousands commas and 2 decimal places (e.g., Rs 12,500.00).</method>
         <method name="format_pkr_whole">Formats monetary amounts with thousands commas rounded to whole rupees (e.g., Rs 12,500).</method>
         <method name="parse_pkr_input">Parses user-entered currency strings by stripping thousands commas and whitespace into Option&lt;f64&gt;.</method>
+        <method name="format_input_date">Formats dates for text input fields as M/D/YYYY (e.g., 9/4/2026).</method>
+        <method name="format_date">Formats dates for UI display as D Mon YYYY without leading zeros (e.g., 4 Sep 2026).</method>
+        <method name="parse_date_input">Parses user input strings supporting M/D/YYYY, D/M/YYYY, YYYY-MM-DD, and D Mon YYYY into Option&lt;NaiveDate&gt;.</method>
         <method name="render_mono">Renders text using tabular monospaced IBM Plex Mono font for aligned figures.</method>
       </methods>
     </module>
@@ -222,13 +337,16 @@
       <description>
         Renders card selection pills, single-row summary card stats (running balance, monthly income, monthly expenses, opening balance),
         toolbar with quick transaction add buttons, period filters, search bar, and egui_extras TableBuilder transaction spreadsheet.
-        Supports editing opening balance amount, description, and date via dedicated modal.
+        Features manual transaction rearranging for same-date rows via Move Up (▲) / Move Down (▼) buttons and a 1-click '⇅ Spending first'
+        toolbar button to prioritize expenses before income on the same date with automatic running balance recalculation.
+        Supports editing opening balance amount, description, and date via dedicated modal. Soft deletes transactions and cards.
       </description>
       <structs>
         <struct name="AccountsViewState">UI state for selected card, date filters, search input, modals, and pending edits.</struct>
       </structs>
       <functions>
         <function name="render_accounts_view">Main rendering entry for the Bank Accounts tab.</function>
+        <function name="sort_spending_first_on_same_date">Sorts same-date transactions on a card so expenses precede income, updating timestamps for cloud sync.</function>
       </functions>
     </module>
 
@@ -259,10 +377,20 @@
         <function name="render_savings_view">Main rendering entry for the Savings Plans tab.</function>
       </functions>
     </module>
+
+    <module file="supabase/schema.sql">
+      <role>Supabase PostgreSQL Schema and Security Rules</role>
+      <description>
+        Defines the database schema on Supabase mirroring local structs field-for-field. Creates cards, transactions,
+        subscriptions, savings_plans, and categories tables. Installs automatic BEFORE UPDATE triggers to maintain updated_at,
+        defines sync indexes on (user_id, updated_at), and enforces strict Row Level Security (RLS) policies isolating data
+        by auth.uid() = user_id.
+      </description>
+    </module>
   </modules>
 
   <testing>
-    <test_file path="tests/core_tests.rs">
+    <test_suite name="Core Domain Tests" file="tests/core_tests.rs">
       <description>Automated test suite verifying domain logic, formatting, and mathematical guarantees.</description>
       <tests>
         <test name="test_currency_formatting_pkr">Verifies comma grouping, whole/decimal formatting, and parse_pkr_input for Pakistani Rupee amounts.</test>
@@ -276,8 +404,41 @@
         <test name="test_font_loading_and_layout">Verifies custom font families, glyph availability, and table layout generation.</test>
         <test name="test_checklist_requirements_integration">End-to-end integration test verifying opening balance persistence, backdating, and comma parsing.</test>
       </tests>
-    </test_file>
+    </test_suite>
+
+    <test_suite name="Cloud Sync Tests" file="tests/sync_tests.rs">
+      <description>Verifies synchronization logic, conflict resolution, offline queue serialization, and token refresh rules.</description>
+      <tests>
+        <test name="test_proactive_token_refresh_threshold">Verifies proactive session refresh triggers when less than 5 minutes of validity remain.</test>
+        <test name="test_backoff_calculation">Verifies exponential backoff calculation: 2s base doubling up to 60s cap with 10 max retries.</test>
+        <test name="test_conflict_resolution_server_wins_on_newer_or_tie">Verifies that server wins when remote timestamp is newer or identical.</test>
+        <test name="test_conflict_resolution_local_wins_if_newer">Verifies that local row wins when local updated_at is more recent than server.</test>
+        <test name="test_soft_delete_conflict_resolution">Verifies that deleted_at timestamps propagate correctly and resolve deletions.</test>
+        <test name="test_per_table_watermarks_isolation">Verifies independent watermark tracking across all 5 domain tables.</test>
+        <test name="test_pending_sync_queue_serialization">Verifies offline queue persistence, addition, and removal from pending_sync.json.</test>
+        <test name="test_billing_cycle_serialization_formats">Verifies custom billing cycle serialization (monthly, yearly, custom:N).</test>
+        <test name="test_legacy_data_json_backward_compatibility_deserialization">Verifies pre-sync data.json without UUIDs or timestamps auto-migrates cleanly.</test>
+      </tests>
+    </test_suite>
+
+    <test_suite name="Redesign &amp; Visual Analytics Tests" file="tests/redesign_part3_tests.rs">
+      <description>Verifies visual dashboard calculations, category colors, savings pacing, and responsive UI scaling.</description>
+      <tests>
+        <test name="test_dashboard_and_12m_subscription_trend">Verifies 12-month commitment projection points and aggregate annual calculations.</test>
+        <test name="test_savings_plan_status_and_projected_pace">Verifies on-track vs behind pacing calculations and projected completion dates.</test>
+        <test name="test_category_color_palette_consistency">Verifies deterministic color assignments across all budget categories.</test>
+        <test name="test_ui_rendering_all_views_at_multiple_window_sizes">Verifies headless UI layout stability across small, standard, and wide display resolutions.</test>
+      </tests>
+    </test_suite>
   </testing>
+
+  <storage_files location="%APPDATA%\SavingsTracker">
+    <file name="data.json">Primary local database holding cards, transactions, subscriptions, savings plans, and categories.</file>
+    <file name="session.json">Stored GoTrue authentication session containing access token, refresh token, and user UUID.</file>
+    <file name="config.json">Supabase project connection settings (project URL and anon public API key).</file>
+    <file name="sync_watermarks.json">Timestamps of the latest successful sync pull for each table.</file>
+    <file name="pending_sync.json">Queue of offline modifications awaiting background retry and cloud upload.</file>
+  </storage_files>
 
   <build_and_release>
     <commands>

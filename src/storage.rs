@@ -50,6 +50,7 @@ impl StorageManager {
                             data.custom_categories.push(cat.to_string());
                         }
                     }
+                    data.ensure_sync_fields();
                     data
                 }
                 Err(err) => {

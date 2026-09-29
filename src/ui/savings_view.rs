@@ -2,8 +2,10 @@ use crate::models::{AppData, SavingsPlan};
 use crate::savings::SavingsEngine;
 use crate::subscriptions::SubscriptionManager;
 use crate::ui::theme::Theme;
-use chrono::{Local, NaiveDate};
-use egui::{Align, Layout, RichText, Rounding, Ui, Vec2};
+use chrono::{Datelike, Local, NaiveDate};
+use egui::{vec2, Align, Color32, Layout, RichText, Rounding, Stroke, Ui, Vec2};
+use egui_extras::{Column, TableBuilder};
+use egui_plot::{Corner, Legend, Line, Plot, PlotPoints};
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -49,7 +51,7 @@ impl SavingsViewState {
         let def_deadline = Local::now().date_naive()
             .checked_add_months(chrono::Months::new(6))
             .unwrap_or_else(|| Local::now().date_naive() + chrono::Duration::days(180));
-        self.deadline_date = def_deadline.format("%Y-%m-%d").to_string();
+        self.deadline_date = Theme::format_input_date(&def_deadline);
         self.monthly_income.clear();
         self.override_spending_limit = false;
         self.spending_limit_override_val.clear();
@@ -63,7 +65,7 @@ impl SavingsViewState {
         self.editing_plan_id = Some(plan.id);
         self.name = plan.name.clone();
         self.target_amount = format!("{:.0}", plan.target_amount);
-        self.deadline_date = plan.deadline.format("%Y-%m-%d").to_string();
+        self.deadline_date = Theme::format_input_date(&plan.deadline);
         self.monthly_income = format!("{:.0}", plan.monthly_income);
         if let Some(ov) = plan.spending_limit_override {
             self.override_spending_limit = true;
@@ -118,7 +120,7 @@ pub fn render_savings_view(
 
                 ui.add_space(8.0);
 
-                let hist_count = data.plans.iter().filter(|p| p.closed).count();
+                let hist_count = data.plans.iter().filter(|p| p.deleted_at.is_none() && p.closed).count();
                 let hist_pill = egui::Frame::none()
                     .fill(if is_hist { Theme::PANEL2 } else { Theme::PANEL })
                     .stroke(if is_hist { Theme::stroke_accent_dim() } else { Theme::stroke_border() })
@@ -157,7 +159,11 @@ pub fn render_savings_view(
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button(RichText::new("Delete").color(Theme::OUT).strong()).clicked() {
-                        data.plans.retain(|p| p.id != del_id);
+                        let now = chrono::Utc::now();
+                        if let Some(p) = data.plans.iter_mut().find(|p| p.id == del_id) {
+                            p.deleted_at = Some(now);
+                            p.updated_at = now;
+                        }
                         *data_changed = true;
                         state.plan_to_delete = None;
                     }
@@ -181,7 +187,7 @@ fn render_active_plans_grid(
     content_width: f32,
     side_margin: f32,
 ) {
-    let active_plans: Vec<SavingsPlan> = data.plans.iter().filter(|p| !p.closed).cloned().collect();
+    let active_plans: Vec<SavingsPlan> = data.plans.iter().filter(|p| p.deleted_at.is_none() && !p.closed).cloned().collect();
 
     egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
         ui.horizontal(|ui| {
@@ -206,16 +212,51 @@ fn render_active_plans_grid(
                         state.deduct_overspending,
                     );
 
+                    // Calculate plan status and color per Section 4.3
+                    let total_days = (plan.deadline - plan.created_at).num_days().max(1) as f64;
+                    let elapsed_days = (today - plan.created_at).num_days().clamp(0, total_days as i64) as f64;
+                    let expected_saved = plan.target_amount * (elapsed_days / total_days);
+                    let diff = calc.total_saved - expected_saved;
+                    let tolerance = (plan.target_amount * 0.05).max(1000.0);
+
+                    let (status_text, status_color) = if calc.total_saved >= plan.target_amount || diff > tolerance {
+                        ("Ahead", Theme::STATUS_AHEAD)
+                    } else if diff < -tolerance || !calc.is_feasible {
+                        ("Behind", Theme::STATUS_BEHIND)
+                    } else {
+                        ("On track", Theme::STATUS_ON_TRACK)
+                    };
+
+                    // Compute projected completion date from recent months' actual surplus
+                    let rem_target = (plan.target_amount - calc.total_saved).max(0.0);
+                    let recent_surpluses: Vec<f64> = calc.breakdowns.iter().rev().take(3).map(|b| b.surplus).collect();
+                    let avg_surplus = if !recent_surpluses.is_empty() {
+                        recent_surpluses.iter().sum::<f64>() / recent_surpluses.len() as f64
+                    } else {
+                        0.0
+                    };
+
+                    let projected_str = if rem_target <= 0.0 {
+                        "At this pace: Target reached!".to_string()
+                    } else if avg_surplus > 10.0 {
+                        let months_needed = (rem_target / avg_surplus).ceil() as u32;
+                        let projected_date = today.checked_add_months(chrono::Months::new(months_needed))
+                            .unwrap_or(today);
+                        format!("At this pace: {}", projected_date.format("%b %Y"))
+                    } else {
+                        "At this pace: Target unachievable at current rate".to_string()
+                    };
+
                     let card_frame = egui::Frame::none()
                         .fill(Theme::PANEL)
                         .stroke(Theme::stroke_border())
                         .rounding(Rounding::same(Theme::RADIUS_CARD))
                         .inner_margin(egui::Margin::symmetric(20.0, Theme::CARD_PADDING));
 
-                    card_frame.show(ui, |ui| {
+                    let card_resp = card_frame.show(ui, |ui| {
                         ui.set_width(ui.available_width());
 
-                        // Row 1: Plan Name (.goal: Space Grotesk 15px bold) and Deadline
+                        // Row 1: Plan Name and Status badge + Deadline date
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(&plan.name)
@@ -236,42 +277,64 @@ fn render_active_plans_grid(
                                         .font(Theme::font_sans(11.0))
                                         .color(Theme::MUTED),
                                 );
+
+                                ui.add_space(8.0);
+
+                                // Status badge pill
+                                egui::Frame::none()
+                                    .fill(Color32::from_rgba_premultiplied(
+                                        (status_color.r() as f32 * 0.15) as u8,
+                                        (status_color.g() as f32 * 0.15) as u8,
+                                        (status_color.b() as f32 * 0.15) as u8,
+                                        38,
+                                    ))
+                                    .stroke(Stroke::new(1.0_f32, status_color))
+                                    .rounding(Rounding::same(Theme::RADIUS_BADGE))
+                                    .inner_margin(egui::Margin::symmetric(7.0, 2.5))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(status_text)
+                                                .font(Theme::font_sans(10.5))
+                                                .strong()
+                                                .color(status_color),
+                                        );
+                                    });
                             });
                         });
 
                         ui.add_space(6.0);
 
-                        // Progress Bar matching .bar (height 7px, radius 4px, background var(--panel2), fill var(--in))
+                        // Progress Bar matching .bar
                         let progress_frac = (calc.percent_reached / 100.0).clamp(0.0, 1.0) as f32;
                         let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 7.0), egui::Sense::hover());
                         ui.painter().rect_filled(bar_rect, Rounding::same(Theme::RADIUS_BAR), Theme::PANEL2);
                         let fill_w = (bar_rect.width() * progress_frac).clamp(0.0, bar_rect.width());
                         if fill_w > 0.0 {
                             let fill_rect = egui::Rect::from_min_size(bar_rect.min, Vec2::new(fill_w, 7.0));
-                            ui.painter().rect_filled(fill_rect, Rounding::same(Theme::RADIUS_BAR), Theme::IN);
+                            ui.painter().rect_filled(fill_rect, Rounding::same(Theme::RADIUS_BAR), status_color);
                         }
 
                         ui.add_space(6.0);
 
-                        // Row 2: Stat line — split "Saved Rs X" / "/ Rs Y target" / "Z%" into separate ui.label calls
+                        // Row 2: Stat line — split "Saved Rs X" / "/ Rs Y target" / "Z%"
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(format!("Saved {}", Theme::format_pkr(calc.total_saved)))
                                     .font(Theme::font_sans(12.5))
                                     .color(Theme::TEXT),
                             );
-                            ui.add_space(12.0);
+                            ui.add_space(10.0);
                             ui.label(
                                 RichText::new(format!("/ {} target", Theme::format_pkr_whole(plan.target_amount)))
                                     .font(Theme::font_sans(12.5))
                                     .color(Theme::MUTED),
                             );
-                            ui.add_space(12.0);
+                            ui.add_space(10.0);
                             ui.label(
                                 RichText::new(format!("{:.0}%", calc.percent_reached))
                                     .font(Theme::font_sans(12.5))
                                     .strong()
-                                    .color(Theme::IN),
+                                    .color(status_color),
                             );
 
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -287,13 +350,21 @@ fn render_active_plans_grid(
                             });
                         });
 
-                        ui.add_space(6.0);
+                        // 12px gap, then Projected-completion line directly beneath Row 2
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(&projected_str)
+                                .font(Theme::font_sans(11.5))
+                                .color(Theme::MUTED),
+                        );
 
-                        // Row 3: Action links (View breakdown, Edit, Delete)
+                        ui.add_space(8.0);
+
+                        // Row 3: Action links (View breakdown / Edit / Delete)
                         let is_expanded = state.expanded_breakdowns.contains(&plan.id);
                         ui.horizontal(|ui| {
                             let expand_label = if is_expanded { "Hide breakdown" } else { "View breakdown" };
-                            if ui.link(RichText::new(expand_label).font(Theme::font_sans(12.0)).color(Theme::FAINT)).clicked() {
+                            if ui.link(RichText::new(expand_label).font(Theme::font_sans(12.0)).color(Theme::ACCENT)).clicked() {
                                 if is_expanded {
                                     state.expanded_breakdowns.remove(&plan.id);
                                 } else {
@@ -301,7 +372,7 @@ fn render_active_plans_grid(
                                 }
                             }
 
-                            ui.add_space(12.0);
+                            ui.add_space(14.0);
                             if ui.link(RichText::new("Edit").font(Theme::font_sans(12.0)).color(Theme::FAINT)).clicked() {
                                 plan_to_edit = Some(plan.clone());
                             }
@@ -313,25 +384,192 @@ fn render_active_plans_grid(
                             });
                         });
 
-                        if is_expanded && !calc.breakdowns.is_empty() {
-                            ui.add_space(6.0);
-                            let (div_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
-                            ui.painter().line_segment([div_rect.left_top(), div_rect.right_top()], Theme::stroke_border());
-                            ui.add_space(4.0);
-                            for b in &calc.breakdowns {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&b.label).font(Theme::font_sans(11.0)).color(Theme::MUTED));
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if b.is_overspent {
-                                            ui.label(RichText::new(format!("Overspent by Rs {:.0}", b.actual_spent - b.spending_limit)).font(Theme::font_sans(11.0)).color(Theme::OUT));
-                                        } else {
-                                            ui.label(RichText::new(format!("+Rs {:.0} saved", b.surplus)).font(Theme::font_sans(11.0)).color(Theme::IN));
-                                        }
-                                    });
-                                });
+                        // EXPANDED BREAKDOWN: Trajectory Chart (4.1) + Mini-Spreadsheet (4.2)
+                        if is_expanded {
+                            ui.add_space(16.0);
+                            let (sep_r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), egui::Sense::hover());
+                            ui.painter().line_segment([sep_r.left_top(), sep_r.right_top()], Theme::stroke_border());
+                            ui.add_space(12.0);
+
+                            // Section header
+                            ui.label(
+                                RichText::new("Savings Trajectory")
+                                    .font(Theme::font_head(13.5))
+                                    .strong()
+                                    .color(Theme::TEXT),
+                            );
+                            ui.add_space(8.0);
+
+                            // 1. Trajectory Chart
+                            let total_plan_months = ((plan.deadline.year() - plan.created_at.year()) * 12
+                                + plan.deadline.month() as i32
+                                - plan.created_at.month() as i32)
+                                .max(1) as f64;
+
+                            let req_pace_points = PlotPoints::new(vec![
+                                [0.0, 0.0],
+                                [total_plan_months, plan.target_amount],
+                            ]);
+                            let req_line = Line::new(req_pace_points)
+                                .name("Required pace")
+                                .color(Theme::ACCENT)
+                                .width(1.8_f32);
+
+                            let mut actual_points = vec![[0.0, 0.0]];
+                            let mut running_sum = 0.0;
+                            for (idx, b) in calc.breakdowns.iter().enumerate() {
+                                running_sum += b.surplus;
+                                actual_points.push([(idx + 1) as f64, running_sum]);
                             }
+                            let act_line = Line::new(PlotPoints::new(actual_points))
+                                .name("Actual saved")
+                                .color(status_color)
+                                .width(2.2_f32);
+
+                            Plot::new(format!("plan_plot_{}", plan.id))
+                                .height(165.0)
+                                .allow_drag(false)
+                                .allow_zoom(false)
+                                .allow_scroll(false)
+                                .show_grid([true, true])
+                                .legend(Legend::default().position(Corner::RightTop))
+                                .x_axis_formatter(|mark, _range| format!("M{}", mark.value as i64))
+                                .y_axis_formatter(|mark, _range| Theme::format_pkr_whole(mark.value))
+                                .show(ui, |plot_ui| {
+                                    plot_ui.line(req_line);
+                                    plot_ui.line(act_line);
+                                });
+
+                            // 16px vertical gap
+                            ui.add_space(16.0);
+
+                            // 2. Monthly Breakdown Mini-Spreadsheet
+                            ui.label(
+                                RichText::new("Monthly Breakdown")
+                                    .font(Theme::font_head(13.5))
+                                    .strong()
+                                    .color(Theme::TEXT),
+                            );
+                            ui.add_space(8.0);
+
+                            let draw_mini_border = |ui: &Ui, is_first: bool| {
+                                let r = ui.max_rect();
+                                ui.painter().line_segment([r.right_top(), r.right_bottom()], Theme::stroke_border());
+                                ui.painter().line_segment([r.left_bottom(), r.right_bottom()], Theme::stroke_border());
+                                if is_first {
+                                    ui.painter().line_segment([r.left_top(), r.left_bottom()], Theme::stroke_border());
+                                }
+                            };
+
+                            TableBuilder::new(ui)
+                                .id_salt(format!("mini_table_{}", plan.id))
+                                .striped(false)
+                                .resizable(false)
+                                .cell_layout(Layout::left_to_right(Align::Center))
+                                .column(Column::initial(80.0))                  // Month
+                                .column(Column::remainder().at_least(65.0))     // Income
+                                .column(Column::remainder().at_least(65.0))     // Limit
+                                .column(Column::remainder().at_least(65.0))     // Spent
+                                .column(Column::remainder().at_least(90.0))     // Surplus/Deficit
+                                .column(Column::remainder().at_least(90.0))     // Running total
+                                .header(26.0, |mut header| {
+                                    header.col(|ui| {
+                                        draw_mini_border(ui, true);
+                                        ui.add_space(6.0);
+                                        ui.label(RichText::new("Month").font(Theme::font_sans(11.0)).color(Theme::MUTED));
+                                    });
+                                    header.col(|ui| {
+                                        draw_mini_border(ui, false);
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.add_space(8.0);
+                                            ui.label(RichText::new("Income").font(Theme::font_sans(11.0)).color(Theme::MUTED));
+                                        });
+                                    });
+                                    header.col(|ui| {
+                                        draw_mini_border(ui, false);
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.add_space(8.0);
+                                            ui.label(RichText::new("Limit").font(Theme::font_sans(11.0)).color(Theme::MUTED));
+                                        });
+                                    });
+                                    header.col(|ui| {
+                                        draw_mini_border(ui, false);
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.add_space(8.0);
+                                            ui.label(RichText::new("Spent").font(Theme::font_sans(11.0)).color(Theme::MUTED));
+                                        });
+                                    });
+                                    header.col(|ui| {
+                                        draw_mini_border(ui, false);
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.add_space(8.0);
+                                            ui.label(RichText::new("Surplus").font(Theme::font_sans(11.0)).color(Theme::MUTED));
+                                        });
+                                    });
+                                    header.col(|ui| {
+                                        draw_mini_border(ui, false);
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.add_space(8.0);
+                                            ui.label(RichText::new("Running total").font(Theme::font_sans(11.0)).color(Theme::MUTED));
+                                        });
+                                    });
+                                })
+                                .body(|mut body| {
+                                    let mut running_sum = 0.0;
+                                    for b in &calc.breakdowns {
+                                        running_sum += b.surplus;
+                                        body.row(28.0, |mut r| {
+                                            r.col(|ui| {
+                                                draw_mini_border(ui, true);
+                                                ui.add_space(6.0);
+                                                ui.label(RichText::new(&b.label).font(Theme::font_sans(11.5)).color(Theme::TEXT));
+                                            });
+                                            r.col(|ui| {
+                                                draw_mini_border(ui, false);
+                                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                    ui.add_space(8.0);
+                                                    Theme::money_label(ui, &Theme::format_pkr_whole(b.monthly_income), Theme::TEXT, 11.5);
+                                                });
+                                            });
+                                            r.col(|ui| {
+                                                draw_mini_border(ui, false);
+                                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                    ui.add_space(8.0);
+                                                    Theme::money_label(ui, &Theme::format_pkr_whole(b.spending_limit), Theme::MUTED, 11.5);
+                                                });
+                                            });
+                                            r.col(|ui| {
+                                                draw_mini_border(ui, false);
+                                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                    ui.add_space(8.0);
+                                                    Theme::money_label(ui, &Theme::format_pkr_whole(b.actual_spent), Theme::TEXT, 11.5);
+                                                });
+                                            });
+                                            r.col(|ui| {
+                                                draw_mini_border(ui, false);
+                                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                    ui.add_space(8.0);
+                                                    let s_col = if b.surplus >= 0.0 { Theme::IN } else { Theme::OUT };
+                                                    let sign = if b.surplus >= 0.0 { "+" } else { "" };
+                                                    ui.label(RichText::new(format!("{}{}", sign, Theme::format_pkr_whole(b.surplus))).font(Theme::font_mono(11.5)).color(s_col));
+                                                });
+                                            });
+                                            r.col(|ui| {
+                                                draw_mini_border(ui, false);
+                                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                    ui.add_space(8.0);
+                                                    let r_col = if running_sum >= 0.0 { Theme::IN } else { Theme::OUT };
+                                                    Theme::money_label(ui, &Theme::format_pkr_whole(running_sum), r_col, 11.5);
+                                                });
+                                            });
+                                        });
+                                    }
+                                });
                         }
                     });
+
+                    // 3px top accent bar per Section 1.4 & 4.3
+                    Theme::paint_card_accent_bar(ui.painter(), card_resp.response.rect, status_color, Theme::RADIUS_CARD);
 
                     ui.add_space(Theme::CARD_GAP);
                 }
@@ -380,7 +618,7 @@ fn render_history_plans_grid(
     content_width: f32,
     side_margin: f32,
 ) {
-    let closed_plans: Vec<SavingsPlan> = data.plans.iter().filter(|p| p.closed).cloned().collect();
+    let closed_plans: Vec<SavingsPlan> = data.plans.iter().filter(|p| p.deleted_at.is_none() && p.closed).cloned().collect();
 
     if closed_plans.is_empty() {
         ui.horizontal(|ui| {
@@ -532,7 +770,7 @@ fn render_plan_modal(
             ui.text_edit_singleline(&mut state.target_amount);
 
             ui.add_space(6.0);
-            ui.label("Deadline Date (YYYY-MM-DD):");
+            ui.label("Deadline Date (M/D/YYYY):");
             ui.text_edit_singleline(&mut state.deadline_date);
 
             ui.add_space(6.0);
@@ -570,7 +808,7 @@ fn render_plan_modal(
 
             let target_parsed = Theme::parse_pkr_input(&state.target_amount).unwrap_or(0.0);
             let income_parsed = Theme::parse_pkr_input(&state.monthly_income).unwrap_or(0.0);
-            let deadline_parsed = NaiveDate::parse_from_str(state.deadline_date.trim(), "%Y-%m-%d").ok();
+            let deadline_parsed = Theme::parse_date_input(&state.deadline_date);
 
             let linked_cards_filter = if state.link_all_cards {
                 None
@@ -611,6 +849,14 @@ fn render_plan_modal(
                             ui.label(format!("• Months remaining: {:.1} months", months_rem));
                             ui.label(format!("• Required savings / mo: {}", Theme::format_pkr(req_savings)));
                             ui.label(format!("• Subscriptions cost: {} / mo", Theme::format_pkr(prorated_sub)));
+                            let annual_reserve = SubscriptionManager::annual_reserve_monthly_needed(&data.subscriptions, linked_cards_filter.as_deref());
+                            if annual_reserve > 0.0 {
+                                ui.label(
+                                    RichText::new(format!("  ↳ includes {}/mo reserved for yearly renewals (sinking fund)", Theme::format_pkr_whole(annual_reserve)))
+                                        .font(Theme::font_sans(11.0))
+                                        .color(Theme::CAT_SUBSCRIPTION),
+                                );
+                            }
                             ui.label(format!("• Recommended spending limit: {} / mo", Theme::format_pkr(rec_limit)));
                             if state.override_spending_limit {
                                 ui.label(format!("• Active override limit: {} / mo", Theme::format_pkr(eff_limit)));
@@ -663,7 +909,7 @@ fn render_plan_modal(
                             return;
                         }
                         None => {
-                            state.modal_error = Some("Invalid deadline date. Use YYYY-MM-DD.".to_string());
+                            state.modal_error = Some("Invalid deadline date. Use M/D/YYYY (e.g. 9/4/2026).".to_string());
                             return;
                         }
                     };
@@ -693,6 +939,7 @@ fn render_plan_modal(
                         Vec::new()
                     };
 
+                    let now = chrono::Utc::now();
                     if let Some(edit_id) = state.editing_plan_id {
                         if let Some(p) = data.plans.iter_mut().find(|p| p.id == edit_id) {
                             p.name = name;
@@ -701,6 +948,8 @@ fn render_plan_modal(
                             p.monthly_income = income_parsed;
                             p.spending_limit_override = override_val;
                             p.linked_card_ids = linked_cards;
+                            p.deduct_overspending = state.deduct_overspending;
+                            p.updated_at = now;
                         }
                     } else {
                         let new_plan = SavingsPlan {
@@ -716,6 +965,9 @@ fn render_plan_modal(
                             closed_at: None,
                             final_saved: None,
                             goal_met: None,
+                            deduct_overspending: state.deduct_overspending,
+                            updated_at: now,
+                            deleted_at: None,
                         };
                         data.plans.push(new_plan);
                     }

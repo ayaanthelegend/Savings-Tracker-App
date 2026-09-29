@@ -1,9 +1,22 @@
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub fn default_uuid() -> Uuid {
+    Uuid::new_v4()
+}
+
+pub fn default_chrono_now() -> DateTime<Utc> {
+    Utc::now()
+}
+
+pub fn default_opening_balance_description() -> String {
+    "Opening Balance".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Card {
+    #[serde(default = "default_uuid")]
     pub id: Uuid,
     pub name: String,
     pub is_primary: bool,
@@ -12,14 +25,15 @@ pub struct Card {
     pub opening_balance_description: String,
     #[serde(default)]
     pub opening_balance_date: Option<NaiveDate>,
-}
-
-pub fn default_opening_balance_description() -> String {
-    "Opening Balance".to_string()
+    #[serde(default = "default_chrono_now")]
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Transaction {
+    #[serde(default = "default_uuid")]
     pub id: Uuid,
     pub card_id: Uuid,
     pub date: NaiveDate,
@@ -29,6 +43,10 @@ pub struct Transaction {
     pub is_income: bool,
     #[serde(default)]
     pub auto_generated: bool,
+    #[serde(default = "default_chrono_now")]
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -47,10 +65,34 @@ impl BillingCycle {
             BillingCycle::CustomDays(days) => format!("Every {} days", days),
         }
     }
+
+    pub fn to_serialized_str(&self) -> String {
+        match self {
+            BillingCycle::Monthly => "monthly".to_string(),
+            BillingCycle::Yearly => "yearly".to_string(),
+            BillingCycle::CustomDays(days) => format!("custom:{}", days),
+        }
+    }
+
+    pub fn from_serialized_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "monthly" => BillingCycle::Monthly,
+            "yearly" => BillingCycle::Yearly,
+            other => {
+                if let Some(days_str) = other.strip_prefix("custom:") {
+                    if let Ok(days) = days_str.parse::<u32>() {
+                        return BillingCycle::CustomDays(days);
+                    }
+                }
+                BillingCycle::Monthly
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Subscription {
+    #[serde(default = "default_uuid")]
     pub id: Uuid,
     pub card_id: Uuid,
     pub name: String,
@@ -60,10 +102,15 @@ pub struct Subscription {
     pub next_due_date: NaiveDate,
     #[serde(default)]
     pub paused: bool,
+    #[serde(default = "default_chrono_now")]
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SavingsPlan {
+    #[serde(default = "default_uuid")]
     pub id: Uuid,
     pub name: String,
     pub target_amount: f64,
@@ -79,6 +126,25 @@ pub struct SavingsPlan {
     pub closed_at: Option<NaiveDate>,
     pub final_saved: Option<f64>,
     pub goal_met: Option<bool>,
+    #[serde(default)]
+    pub deduct_overspending: bool,
+    #[serde(default = "default_chrono_now")]
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Category {
+    #[serde(default = "default_uuid")]
+    pub id: Uuid,
+    pub name: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default = "default_chrono_now")]
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,12 +154,41 @@ pub struct AppData {
     pub subscriptions: Vec<Subscription>,
     pub plans: Vec<SavingsPlan>,
     pub custom_categories: Vec<String>,
+    #[serde(default)]
+    pub categories: Vec<Category>,
     pub last_checked_date: Option<NaiveDate>,
+}
+
+impl AppData {
+    /// Ensures that loaded data from disk has valid sync timestamps and that categories match custom_categories.
+    pub fn ensure_sync_fields(&mut self) {
+        let now = Utc::now();
+        // Synchronize categories and custom_categories
+        if self.categories.is_empty() && !self.custom_categories.is_empty() {
+            let defaults = ["Food", "Income", "Subscription", "Transport", "Shopping", "Other"];
+            for cat_name in &self.custom_categories {
+                self.categories.push(Category {
+                    id: Uuid::new_v4(),
+                    name: cat_name.clone(),
+                    is_default: defaults.iter().any(|d| d.eq_ignore_ascii_case(cat_name)),
+                    updated_at: now,
+                    deleted_at: None,
+                });
+            }
+        } else {
+            for cat in &self.categories {
+                if cat.deleted_at.is_none() && !self.custom_categories.iter().any(|c| c.eq_ignore_ascii_case(&cat.name)) {
+                    self.custom_categories.push(cat.name.clone());
+                }
+            }
+        }
+    }
 }
 
 impl Default for AppData {
     fn default() -> Self {
         let default_card_id = Uuid::new_v4();
+        let now = Utc::now();
         let default_card = Card {
             id: default_card_id,
             name: "Main Card".to_string(),
@@ -101,6 +196,8 @@ impl Default for AppData {
             opening_balance: 0.0,
             opening_balance_description: "Opening Balance".to_string(),
             opening_balance_date: None,
+            updated_at: now,
+            deleted_at: None,
         };
 
         // Today or Sep 2026 default seed date
@@ -128,6 +225,8 @@ impl Default for AppData {
             start_date: hbo_start,
             next_due_date: hbo_next,
             paused: false,
+            updated_at: now,
+            deleted_at: None,
         };
 
         let spotify = Subscription {
@@ -139,21 +238,37 @@ impl Default for AppData {
             start_date: spotify_start,
             next_due_date: spotify_next,
             paused: false,
+            updated_at: now,
+            deleted_at: None,
         };
+
+        let default_categories = vec![
+            "Food".to_string(),
+            "Income".to_string(),
+            "Subscription".to_string(),
+            "Transport".to_string(),
+            "Shopping".to_string(),
+            "Other".to_string(),
+        ];
+
+        let categories = default_categories
+            .iter()
+            .map(|name| Category {
+                id: Uuid::new_v4(),
+                name: name.clone(),
+                is_default: true,
+                updated_at: now,
+                deleted_at: None,
+            })
+            .collect();
 
         Self {
             cards: vec![default_card],
             transactions: Vec::new(),
             subscriptions: vec![hbo, spotify],
             plans: Vec::new(),
-            custom_categories: vec![
-                "Food".to_string(),
-                "Income".to_string(),
-                "Subscription".to_string(),
-                "Transport".to_string(),
-                "Shopping".to_string(),
-                "Other".to_string(),
-            ],
+            custom_categories: default_categories,
+            categories,
             last_checked_date: Some(seed_date),
         }
     }

@@ -143,6 +143,9 @@ impl SavingsEngine {
         let linked_txs: Vec<&Transaction> = all_transactions
             .iter()
             .filter(|t| {
+                if t.deleted_at.is_some() {
+                    return false;
+                }
                 if !plan.linked_card_ids.is_empty() && !plan.linked_card_ids.contains(&t.card_id) {
                     return false;
                 }
@@ -235,8 +238,9 @@ impl SavingsEngine {
 
     /// Checks all active plans against system date `today`.
     pub fn check_expirations(data: &mut AppData, today: NaiveDate) {
+        let now = chrono::Utc::now();
         for plan in &mut data.plans {
-            if !plan.closed && today >= plan.deadline {
+            if !plan.closed && plan.deleted_at.is_none() && today >= plan.deadline {
                 let prorated_sub = SubscriptionManager::total_monthly_cost(
                     &data.subscriptions,
                     if plan.linked_card_ids.is_empty() {
@@ -253,6 +257,7 @@ impl SavingsEngine {
                 plan.final_saved = Some(calc.total_saved);
                 let hit_goal = calc.total_saved >= plan.target_amount;
                 plan.goal_met = Some(hit_goal);
+                plan.updated_at = now;
 
                 // Native Windows Toast Notification
                 let title = format!("Savings Plan Ended: {}", plan.name);

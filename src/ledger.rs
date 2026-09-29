@@ -21,13 +21,16 @@ impl LedgerCalculator {
     /// Computes full chronological ledger rows for a card starting from its opening balance.
     /// Each row contains its exact running balance.
     pub fn compute_full_ledger(card: &Card, all_transactions: &[Transaction]) -> Vec<LedgerRow> {
-        let mut card_txs: Vec<&Transaction> = all_transactions
+        let mut indexed_txs: Vec<(usize, &Transaction)> = all_transactions
             .iter()
-            .filter(|t| t.card_id == card.id)
+            .enumerate()
+            .filter(|(_, t)| t.card_id == card.id && t.deleted_at.is_none())
             .collect();
 
-        // Sort chronologically ascending: by date, then by ID
-        card_txs.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.id.cmp(&b.id)));
+        // Sort chronologically ascending: by date, then preserve relative position in all_transactions
+        indexed_txs.sort_by(|(idx_a, a), (idx_b, b)| a.date.cmp(&b.date).then_with(|| idx_a.cmp(idx_b)));
+
+        let card_txs: Vec<&Transaction> = indexed_txs.into_iter().map(|(_, t)| t).collect();
 
         let mut rows = Vec::with_capacity(card_txs.len() + 1);
 

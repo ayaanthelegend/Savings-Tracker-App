@@ -2,9 +2,17 @@ use crate::ledger::LedgerCalculator;
 use crate::models::{AppData, Card, Transaction};
 use crate::ui::theme::Theme;
 use chrono::{Datelike, Local, NaiveDate};
-use egui::{Align, Color32, Layout, RichText, Rounding, Stroke, Ui, Vec2};
+use egui::{pos2, vec2, Align, Color32, Layout, RichText, Rounding, Stroke, Ui, Vec2};
 use egui_extras::{Column, TableBuilder};
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpreadsheetCol {
+    Description = 0,
+    Category = 1,
+    MoneyIn = 2,
+    MoneyOut = 3,
+}
 
 #[derive(Default)]
 pub struct AccountsViewState {
@@ -15,6 +23,11 @@ pub struct AccountsViewState {
     pub selected_category: String,
     pub search_query: String,
     pub sort_descending: bool,
+
+    // Spreadsheet inline editing & navigation state
+    pub active_edit: Option<(Uuid, SpreadsheetCol)>,
+    pub edit_str: String,
+    pub edit_just_focused: bool,
 
     // Modals
     pub show_add_card: bool,
@@ -61,7 +74,7 @@ impl AccountsViewState {
         self.show_tx_modal = true;
         self.editing_tx_id = None;
         self.tx_is_income = is_income;
-        self.tx_date = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        self.tx_date = Theme::format_input_date(&Local::now().date_naive());
         self.tx_description.clear();
         self.tx_category = if is_income {
             "Income".to_string()
@@ -76,7 +89,7 @@ impl AccountsViewState {
         self.show_tx_modal = true;
         self.editing_tx_id = Some(tx.id);
         self.tx_is_income = tx.is_income;
-        self.tx_date = tx.date.format("%Y-%m-%d").to_string();
+        self.tx_date = Theme::format_input_date(&tx.date);
         self.tx_description = tx.description.clone();
         self.tx_category = tx.category.clone();
         self.tx_amount = format!("{:.2}", tx.amount);
@@ -87,9 +100,8 @@ impl AccountsViewState {
         self.show_opening_balance_modal = true;
         self.op_bal_amount = format!("{:.2}", card.opening_balance);
         self.op_bal_description = card.opening_balance_description.clone();
-        self.op_bal_date = card.opening_balance_date
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| default_date.format("%Y-%m-%d").to_string());
+        let d = card.opening_balance_date.unwrap_or(default_date);
+        self.op_bal_date = Theme::format_input_date(&d);
         self.op_bal_error = None;
     }
 }
@@ -256,8 +268,8 @@ pub fn render_accounts_view(
             Some(today),
         ),
         DateFilterPresetWrapper::Custom => {
-            let f = NaiveDate::parse_from_str(&state.custom_date_from, "%Y-%m-%d").ok();
-            let t = NaiveDate::parse_from_str(&state.custom_date_to, "%Y-%m-%d").ok();
+            let f = Theme::parse_date_input(&state.custom_date_from);
+            let t = Theme::parse_date_input(&state.custom_date_to);
             (f, t)
         }
     };
@@ -508,8 +520,9 @@ pub fn render_accounts_view(
                                         if seg_resp.clicked() {
                                             state.filter_preset = preset;
                                             if preset == DateFilterPresetWrapper::Custom && state.custom_date_from.is_empty() {
-                                                state.custom_date_from = today.format("%Y-%m-01").to_string();
-                                                state.custom_date_to = today.format("%Y-%m-%d").to_string();
+                                                let first_of_month = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
+                                                state.custom_date_from = Theme::format_input_date(&first_of_month);
+                                                state.custom_date_to = Theme::format_input_date(&today);
                                             }
                                         }
                                     }
@@ -518,9 +531,9 @@ pub fn render_accounts_view(
 
                         if state.filter_preset == DateFilterPresetWrapper::Custom {
                             ui.add_space(4.0);
-                            ui.add(egui::TextEdit::singleline(&mut state.custom_date_from).desired_width(75.0).hint_text("YYYY-MM-DD"));
+                            ui.add(egui::TextEdit::singleline(&mut state.custom_date_from).desired_width(75.0).hint_text("M/D/YYYY"));
                             ui.label(RichText::new("-").color(Theme::MUTED));
-                            ui.add(egui::TextEdit::singleline(&mut state.custom_date_to).desired_width(75.0).hint_text("YYYY-MM-DD"));
+                            ui.add(egui::TextEdit::singleline(&mut state.custom_date_to).desired_width(75.0).hint_text("M/D/YYYY"));
                         }
 
                         ui.add_space(10.0);
@@ -539,6 +552,22 @@ pub fn render_accounts_view(
                                 }
                             });
 
+                        ui.add_space(8.0);
+
+                        // Quick action: Sort same-date transactions with Spending first
+                        let sort_btn = egui::Frame::none()
+                            .stroke(Theme::stroke_border())
+                            .rounding(Rounding::same(Theme::RADIUS_BTN))
+                            .inner_margin(egui::Margin::symmetric(10.0, 5.0));
+                        let sort_resp = sort_btn.show(ui, |ui| {
+                            ui.label(RichText::new("⇅ Spending first").font(Theme::font_sans(12.0)).color(Theme::MUTED));
+                        }).response.interact(egui::Sense::click()).on_hover_text("Sort same-date transactions so spendings appear before income");
+                        if sort_resp.clicked() {
+                            if sort_spending_first_on_same_date(data, current_card.id) {
+                                *data_changed = true;
+                            }
+                        }
+
                         // Search box aligned to the right
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add(
@@ -554,51 +583,81 @@ pub fn render_accounts_view(
             let (sep_rect2, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
             ui.painter().line_segment([sep_rect2.left_top(), sep_rect2.right_top()], Theme::stroke_border());
 
-            // C. TRANSACTION TABLE SECTION (Built with TableBuilder for precise column alignment)
+            // C. TRANSACTION TABLE SECTION (Spreadsheet Grid with visible cell grid lines and inline editing)
             let mut tx_to_delete = None;
             let mut tx_to_edit = None;
+            let mut tx_to_swap: Option<(Uuid, Uuid)> = None;
+
+            let max_expense_visible = displayed_rows
+                .iter()
+                .filter_map(|r| if !r.is_opening_balance { r.money_out } else { None })
+                .fold(0.0_f64, f64::max);
+
+            let editable_tx_ids: Vec<Uuid> = displayed_rows
+                .iter()
+                .filter_map(|r| r.transaction_id)
+                .collect();
 
             TableBuilder::new(ui)
+                .id_salt("accounts_spreadsheet_grid")
                 .striped(false)
-                .resizable(false)
+                .resizable(true)
                 .cell_layout(Layout::left_to_right(Align::Center))
-                .column(Column::exact(105.0))                // Date
-                .column(Column::remainder().at_least(180.0)) // Description
-                .column(Column::exact(130.0))                // Category
-                .column(Column::exact(120.0))                // In (PKR)
-                .column(Column::exact(120.0))                // Out (PKR)
-                .column(Column::exact(130.0))                // Balance
-                .column(Column::exact(85.0))                 // Actions
+                .column(Column::initial(105.0).resizable(true).at_least(85.0))   // Date
+                .column(Column::initial(220.0).resizable(true).at_least(130.0))  // Description
+                .column(Column::initial(130.0).resizable(true).at_least(90.0))   // Category
+                .column(Column::initial(120.0).resizable(true).at_least(85.0))   // In (PKR)
+                .column(Column::initial(120.0).resizable(true).at_least(85.0))   // Out (PKR)
+                .column(Column::initial(130.0).resizable(true).at_least(90.0))   // Balance
+                .column(Column::initial(130.0).resizable(true).at_least(110.0))  // Actions
                 .header(34.0, |mut header| {
+                    let draw_header_cell_border = |ui: &Ui, is_first: bool| {
+                        let r = ui.max_rect();
+                        ui.painter().line_segment([r.right_top(), r.right_bottom()], Theme::stroke_border());
+                        ui.painter().line_segment([r.left_bottom(), r.right_bottom()], Theme::stroke_border());
+                        if is_first {
+                            ui.painter().line_segment([r.left_top(), r.left_bottom()], Theme::stroke_border());
+                        }
+                    };
+
                     header.col(|ui| {
-                        ui.add_space(22.0);
+                        draw_header_cell_border(ui, true);
+                        ui.add_space(14.0);
                         ui.label(RichText::new("Date").font(Theme::font_sans(12.0)).color(Theme::MUTED));
                     });
                     header.col(|ui| {
+                        draw_header_cell_border(ui, false);
+                        ui.add_space(10.0);
                         ui.label(RichText::new("Description").font(Theme::font_sans(12.0)).color(Theme::MUTED));
                     });
                     header.col(|ui| {
+                        draw_header_cell_border(ui, false);
+                        ui.add_space(10.0);
                         ui.label(RichText::new("Category").font(Theme::font_sans(12.0)).color(Theme::MUTED));
                     });
                     header.col(|ui| {
+                        draw_header_cell_border(ui, false);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(14.0);
                             ui.label(RichText::new("In (PKR)").font(Theme::font_sans(12.0)).color(Theme::MUTED));
                         });
                     });
                     header.col(|ui| {
+                        draw_header_cell_border(ui, false);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(14.0);
                             ui.label(RichText::new("Out (PKR)").font(Theme::font_sans(12.0)).color(Theme::MUTED));
                         });
                     });
                     header.col(|ui| {
+                        draw_header_cell_border(ui, false);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(14.0);
                             ui.label(RichText::new("Balance").font(Theme::font_sans(12.0)).color(Theme::MUTED));
                         });
                     });
                     header.col(|ui| {
+                        draw_header_cell_border(ui, false);
                         ui.horizontal(|ui| {
                             ui.add_space(8.0);
                             ui.label(RichText::new("Actions").font(Theme::font_sans(12.0)).color(Theme::MUTED));
@@ -606,18 +665,24 @@ pub fn render_accounts_view(
                     });
                 })
                 .body(|mut body| {
-                    for row in &displayed_rows {
+                    for (row_idx, row) in displayed_rows.iter().enumerate() {
                         body.row(36.0, |mut r| {
                             let is_op = row.is_opening_balance;
-                            let draw_border = |ui: &Ui| {
-                                let r = ui.max_rect();
-                                ui.painter().line_segment([r.left_bottom(), r.right_bottom()], Theme::stroke_border());
+                            let current_tx_id = row.transaction_id;
+
+                            let draw_cell_border = |ui: &Ui, is_first: bool| {
+                                let rect = ui.max_rect();
+                                ui.painter().line_segment([rect.right_top(), rect.right_bottom()], Theme::stroke_border());
+                                ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Theme::stroke_border());
+                                if is_first {
+                                    ui.painter().line_segment([rect.left_top(), rect.left_bottom()], Theme::stroke_border());
+                                }
                             };
 
-                            // 1. Date
+                            // 1. Date Column
                             r.col(|ui| {
-                                draw_border(ui);
-                                ui.add_space(22.0);
+                                draw_cell_border(ui, true);
+                                ui.add_space(14.0);
                                 if is_op {
                                     ui.label(RichText::new(Theme::format_date(&row.date)).font(Theme::font_sans(12.5)).italics().color(Theme::FAINT));
                                 } else {
@@ -625,64 +690,259 @@ pub fn render_accounts_view(
                                 }
                             });
 
-                            // 2. Description
+                            // 2. Description Column (Inline Editable)
                             r.col(|ui| {
-                                draw_border(ui);
+                                draw_cell_border(ui, false);
+                                let cell_rect = ui.max_rect();
+
                                 if is_op {
+                                    ui.add_space(10.0);
+                                    let resp = ui.interact(cell_rect, ui.id().with("op_desc"), egui::Sense::click());
+                                    if resp.double_clicked() {
+                                        state.open_edit_opening_balance(&current_card, today);
+                                    }
                                     ui.label(RichText::new(&row.description).font(Theme::font_sans(13.0)).italics().color(Theme::FAINT));
-                                } else {
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new(&row.description).font(Theme::font_sans(13.0)).color(Theme::TEXT));
-                                        if row.auto_generated {
-                                            ui.colored_label(Theme::ACCENT, RichText::new("[Auto]").font(Theme::font_sans(10.0)));
+                                } else if let Some(tx_id) = current_tx_id {
+                                    let is_editing = state.active_edit == Some((tx_id, SpreadsheetCol::Description));
+
+                                    if is_editing {
+                                        let te = egui::TextEdit::singleline(&mut state.edit_str)
+                                            .desired_width(ui.available_width() - 8.0);
+                                        let te_resp = ui.add(te);
+                                        if state.edit_just_focused {
+                                            te_resp.request_focus();
+                                            state.edit_just_focused = false;
                                         }
-                                    });
+
+                                        handle_cell_keys(
+                                            ui,
+                                            &te_resp,
+                                            data,
+                                            state,
+                                            tx_id,
+                                            SpreadsheetCol::Description,
+                                            &editable_tx_ids,
+                                            data_changed,
+                                        );
+                                    } else {
+                                        let resp = ui.interact(cell_rect, ui.id().with(tx_id).with(0), egui::Sense::click());
+                                        if resp.double_clicked() {
+                                            state.active_edit = Some((tx_id, SpreadsheetCol::Description));
+                                            state.edit_str = load_cell_val(&data.transactions, tx_id, SpreadsheetCol::Description);
+                                            state.edit_just_focused = true;
+                                        }
+                                        ui.add_space(10.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(&row.description).font(Theme::font_sans(13.0)).color(Theme::TEXT));
+                                            if row.auto_generated {
+                                                ui.colored_label(Theme::ACCENT, RichText::new("[Auto]").font(Theme::font_sans(10.0)));
+                                            }
+                                        });
+                                    }
                                 }
                             });
 
-                            // 3. Category
+                            // 3. Category Column (Inline Chip / Dropdown Editable)
                             r.col(|ui| {
-                                draw_border(ui);
+                                draw_cell_border(ui, false);
+                                let cell_rect = ui.max_rect();
+
                                 if is_op {
+                                    ui.add_space(10.0);
                                     ui.label(RichText::new("—").font(Theme::font_sans(12.5)).italics().color(Theme::FAINT));
-                                } else {
-                                    ui.label(RichText::new(&row.category).font(Theme::font_sans(12.5)).color(Theme::MUTED));
+                                } else if let Some(tx_id) = current_tx_id {
+                                    let is_editing = state.active_edit == Some((tx_id, SpreadsheetCol::Category));
+
+                                    if is_editing {
+                                        let mut selected_cat = state.edit_str.clone();
+                                        egui::ComboBox::from_id_salt(format!("cat_combo_{}", tx_id))
+                                            .width(ui.available_width() - 8.0)
+                                            .selected_text(&selected_cat)
+                                            .show_ui(ui, |ui| {
+                                                for cat in &data.custom_categories {
+                                                    if ui.selectable_label(selected_cat == *cat, cat).clicked() {
+                                                        selected_cat = cat.clone();
+                                                        state.edit_str = cat.clone();
+                                                        commit_cell(&mut data.transactions, tx_id, SpreadsheetCol::Category, &state.edit_str, data_changed);
+                                                        state.active_edit = None;
+                                                    }
+                                                }
+                                            });
+
+                                        let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                        let tab_pressed = ui.input(|i| i.key_pressed(egui::Key::Tab));
+                                        let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                        if esc_pressed {
+                                            state.active_edit = None;
+                                        } else if enter_pressed || tab_pressed {
+                                            commit_cell(&mut data.transactions, tx_id, SpreadsheetCol::Category, &state.edit_str, data_changed);
+                                            state.active_edit = None;
+                                        }
+                                    } else {
+                                        let resp = ui.interact(cell_rect, ui.id().with(tx_id).with(1), egui::Sense::click());
+                                        if resp.double_clicked() {
+                                            state.active_edit = Some((tx_id, SpreadsheetCol::Category));
+                                            state.edit_str = load_cell_val(&data.transactions, tx_id, SpreadsheetCol::Category);
+                                            state.edit_just_focused = true;
+                                        }
+
+                                        // Render category color chip per Section 7.3
+                                        let cat_color = Theme::category_color(&row.category);
+                                        let bg_chip = Color32::from_rgba_premultiplied(
+                                            (cat_color.r() as f32 * 0.15) as u8,
+                                            (cat_color.g() as f32 * 0.15) as u8,
+                                            (cat_color.b() as f32 * 0.15) as u8,
+                                            38,
+                                        );
+
+                                        let galley = ui.painter().layout_no_wrap(
+                                            row.category.clone(),
+                                            Theme::font_sans(12.0),
+                                            cat_color,
+                                        );
+                                        let chip_w = (galley.size().x + 14.0).min(cell_rect.width() - 16.0);
+                                        let chip_h = 24.0;
+                                        let chip_rect = egui::Rect::from_min_size(
+                                            pos2(cell_rect.left() + 8.0, cell_rect.center().y - chip_h / 2.0),
+                                            vec2(chip_w, chip_h),
+                                        );
+
+                                        ui.painter().rect_filled(chip_rect, Rounding::same(Theme::RADIUS_BADGE), bg_chip);
+                                        ui.painter().galley(chip_rect.center() - galley.size() / 2.0, galley, cat_color);
+                                    }
                                 }
                             });
 
-                            // 4. In (PKR)
+                            // 4. In (PKR) Column (Inline Editable)
                             r.col(|ui| {
-                                draw_border(ui);
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    ui.add_space(14.0);
-                                    if is_op {
+                                draw_cell_border(ui, false);
+                                let cell_rect = ui.max_rect();
+
+                                if is_op {
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.add_space(14.0);
                                         ui.label(RichText::new("—").font(Theme::font_mono(13.0)).color(Theme::FAINT));
-                                    } else if let Some(val) = row.money_in {
-                                        Theme::money_label(ui, &Theme::format_pkr(val), Theme::IN, 13.0);
+                                    });
+                                } else if let Some(tx_id) = current_tx_id {
+                                    let is_editing = state.active_edit == Some((tx_id, SpreadsheetCol::MoneyIn));
+
+                                    if is_editing {
+                                        let te = egui::TextEdit::singleline(&mut state.edit_str)
+                                            .desired_width(ui.available_width() - 8.0);
+                                        let te_resp = ui.add(te);
+                                        if state.edit_just_focused {
+                                            te_resp.request_focus();
+                                            state.edit_just_focused = false;
+                                        }
+
+                                        handle_cell_keys(
+                                            ui,
+                                            &te_resp,
+                                            data,
+                                            state,
+                                            tx_id,
+                                            SpreadsheetCol::MoneyIn,
+                                            &editable_tx_ids,
+                                            data_changed,
+                                        );
                                     } else {
-                                        ui.label(RichText::new("—").font(Theme::font_mono(13.0)).color(Theme::FAINT));
+                                        let resp = ui.interact(cell_rect, ui.id().with(tx_id).with(2), egui::Sense::click());
+                                        if resp.double_clicked() {
+                                            state.active_edit = Some((tx_id, SpreadsheetCol::MoneyIn));
+                                            state.edit_str = load_cell_val(&data.transactions, tx_id, SpreadsheetCol::MoneyIn);
+                                            state.edit_just_focused = true;
+                                        }
+
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.add_space(14.0);
+                                            if let Some(val) = row.money_in {
+                                                Theme::money_label(ui, &Theme::format_pkr(val), Theme::IN, 13.0);
+                                            } else {
+                                                ui.label(RichText::new("—").font(Theme::font_mono(13.0)).color(Theme::FAINT));
+                                            }
+                                        });
                                     }
-                                });
+                                }
                             });
 
-                            // 5. Out (PKR)
+                            // 5. Out (PKR) Column (Data Bar Overlay + Inline Editable)
                             r.col(|ui| {
-                                draw_border(ui);
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    ui.add_space(14.0);
-                                    if is_op {
+                                draw_cell_border(ui, false);
+                                let cell_rect = ui.max_rect();
+
+                                if is_op {
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.add_space(14.0);
                                         ui.label(RichText::new("—").font(Theme::font_mono(13.0)).color(Theme::FAINT));
-                                    } else if let Some(val) = row.money_out {
-                                        Theme::money_label(ui, &Theme::format_pkr(val), Theme::OUT, 13.0);
+                                    });
+                                } else if let Some(tx_id) = current_tx_id {
+                                    let is_editing = state.active_edit == Some((tx_id, SpreadsheetCol::MoneyOut));
+
+                                    if is_editing {
+                                        let te = egui::TextEdit::singleline(&mut state.edit_str)
+                                            .desired_width(ui.available_width() - 8.0);
+                                        let te_resp = ui.add(te);
+                                        if state.edit_just_focused {
+                                            te_resp.request_focus();
+                                            state.edit_just_focused = false;
+                                        }
+
+                                        handle_cell_keys(
+                                            ui,
+                                            &te_resp,
+                                            data,
+                                            state,
+                                            tx_id,
+                                            SpreadsheetCol::MoneyOut,
+                                            &editable_tx_ids,
+                                            data_changed,
+                                        );
                                     } else {
-                                        ui.label(RichText::new("—").font(Theme::font_mono(13.0)).color(Theme::FAINT));
+                                        let resp = ui.interact(cell_rect, ui.id().with(tx_id).with(3), egui::Sense::click());
+                                        if resp.double_clicked() {
+                                            state.active_edit = Some((tx_id, SpreadsheetCol::MoneyOut));
+                                            state.edit_str = load_cell_val(&data.transactions, tx_id, SpreadsheetCol::MoneyOut);
+                                            state.edit_just_focused = true;
+                                        }
+
+                                        // Render inline data-bar overlay behind numeric text
+                                        if let Some(val) = row.money_out {
+                                            if max_expense_visible > 0.0 {
+                                                let ratio = (val / max_expense_visible).clamp(0.0, 1.0) as f32;
+                                                let bar_w = ((cell_rect.width() - 8.0) * ratio).max(3.0);
+                                                let bar_rect = egui::Rect::from_min_size(
+                                                    pos2(cell_rect.left() + 4.0, cell_rect.bottom() - 3.5),
+                                                    vec2(bar_w, 3.0),
+                                                );
+                                                // --out at 25% opacity
+                                                let bar_col = Color32::from_rgba_premultiplied(60, 28, 26, 64);
+                                                ui.painter().rect_filled(bar_rect, Rounding::same(1.5), bar_col);
+                                            }
+                                        }
+
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.add_space(14.0);
+                                            if let Some(val) = row.money_out {
+                                                Theme::money_label(ui, &Theme::format_pkr(val), Theme::OUT, 13.0);
+                                            } else {
+                                                ui.label(RichText::new("—").font(Theme::font_mono(13.0)).color(Theme::FAINT));
+                                            }
+                                        });
                                     }
-                                });
+                                }
                             });
 
-                            // 6. Balance
+                            // 6. Balance Column
                             r.col(|ui| {
-                                draw_border(ui);
+                                draw_cell_border(ui, false);
+                                let cell_rect = ui.max_rect();
+                                if is_op {
+                                    let resp = ui.interact(cell_rect, ui.id().with("op_bal"), egui::Sense::click());
+                                    if resp.double_clicked() {
+                                        state.open_edit_opening_balance(&current_card, today);
+                                    }
+                                }
+
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.add_space(14.0);
                                     let bal_col = if is_op {
@@ -696,22 +956,54 @@ pub fn render_accounts_view(
                                 });
                             });
 
-                            // 7. Actions
+                            // 7. Actions Column
                             r.col(|ui| {
-                                draw_border(ui);
+                                draw_cell_border(ui, false);
                                 ui.horizontal(|ui| {
-                                    ui.add_space(8.0);
+                                    ui.add_space(4.0);
                                     if is_op {
                                         if ui.link(RichText::new("Edit").font(Theme::font_sans(12.0)).color(Theme::FAINT)).clicked() {
                                             state.open_edit_opening_balance(&current_card, today);
                                         }
                                     } else if let Some(tx_id) = row.transaction_id {
+                                        let row_date = row.date;
+                                        let can_move_up = row_idx > 0
+                                            && displayed_rows[row_idx - 1].transaction_id.is_some()
+                                            && displayed_rows[row_idx - 1].date == row_date;
+                                        let prev_tx_id = if can_move_up { displayed_rows[row_idx - 1].transaction_id } else { None };
+
+                                        let can_move_down = row_idx + 1 < displayed_rows.len()
+                                            && displayed_rows[row_idx + 1].transaction_id.is_some()
+                                            && displayed_rows[row_idx + 1].date == row_date;
+                                        let next_tx_id = if can_move_down { displayed_rows[row_idx + 1].transaction_id } else { None };
+
+                                        if can_move_up {
+                                            if ui.small_button(RichText::new("▲").size(10.0).color(Theme::TEXT)).on_hover_text("Move up on same date").clicked() {
+                                                if let Some(other_id) = prev_tx_id {
+                                                    tx_to_swap = Some((tx_id, other_id));
+                                                }
+                                            }
+                                        } else {
+                                            ui.add_enabled(false, egui::Button::new(RichText::new("▲").size(10.0)).small());
+                                        }
+
+                                        if can_move_down {
+                                            if ui.small_button(RichText::new("▼").size(10.0).color(Theme::TEXT)).on_hover_text("Move down on same date").clicked() {
+                                                if let Some(other_id) = next_tx_id {
+                                                    tx_to_swap = Some((tx_id, other_id));
+                                                }
+                                            }
+                                        } else {
+                                            ui.add_enabled(false, egui::Button::new(RichText::new("▼").size(10.0)).small());
+                                        }
+
+                                        ui.add_space(2.0);
                                         if ui.link(RichText::new("Edit").font(Theme::font_sans(12.0)).color(Theme::FAINT)).clicked() {
                                             if let Some(tx) = data.transactions.iter().find(|t| t.id == tx_id) {
                                                 tx_to_edit = Some(tx.clone());
                                             }
                                         }
-                                        ui.add_space(6.0);
+                                        ui.add_space(4.0);
                                         if ui.link(RichText::new("Del").font(Theme::font_sans(12.0)).color(Theme::FAINT)).clicked() {
                                             tx_to_delete = Some(tx_id);
                                         }
@@ -722,12 +1014,29 @@ pub fn render_accounts_view(
                     }
                 });
 
+            if let Some((id1, id2)) = tx_to_swap {
+                if let (Some(idx1), Some(idx2)) = (
+                    data.transactions.iter().position(|t| t.id == id1),
+                    data.transactions.iter().position(|t| t.id == id2),
+                ) {
+                    data.transactions.swap(idx1, idx2);
+                    let now = chrono::Utc::now();
+                    data.transactions[idx1].updated_at = now;
+                    data.transactions[idx2].updated_at = now;
+                    *data_changed = true;
+                }
+            }
+
             if let Some(tx) = tx_to_edit {
                 state.open_edit_tx(&tx);
             }
 
             if let Some(del_id) = tx_to_delete {
-                data.transactions.retain(|t| t.id != del_id);
+                let now = chrono::Utc::now();
+                if let Some(t) = data.transactions.iter_mut().find(|t| t.id == del_id) {
+                    t.deleted_at = Some(now);
+                    t.updated_at = now;
+                }
                 *data_changed = true;
             }
         });
@@ -758,13 +1067,16 @@ pub fn render_accounts_view(
                         let name = state.new_card_name.trim().to_string();
                         if !name.is_empty() {
                             let op_bal = Theme::parse_pkr_input(&state.new_card_opening_balance).unwrap_or(0.0);
+                            let now = chrono::Utc::now();
                             let new_card = Card {
                                 id: Uuid::new_v4(),
                                 name,
-                                is_primary: data.cards.is_empty(),
+                                is_primary: data.cards.iter().all(|c| c.deleted_at.is_some()),
                                 opening_balance: op_bal,
                                 opening_balance_description: "Opening Balance".to_string(),
                                 opening_balance_date: None,
+                                updated_at: now,
+                                deleted_at: None,
                             };
                             let new_id = new_card.id;
                             data.cards.push(new_card);
@@ -799,6 +1111,7 @@ pub fn render_accounts_view(
                         if !name.is_empty() {
                             if let Some(c) = data.cards.iter_mut().find(|c| c.id == active_card_id) {
                                 c.name = name;
+                                c.updated_at = chrono::Utc::now();
                                 *data_changed = true;
                             }
                             state.show_rename_card = false;
@@ -825,22 +1138,32 @@ pub fn render_accounts_view(
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui.button(RichText::new("Delete Permanently").color(Theme::EXPENSE).strong()).clicked() {
-                        data.cards.retain(|c| c.id != del_card_id);
-                        data.transactions.retain(|t| t.card_id != del_card_id);
-                        if let Some(first) = data.cards.first() {
+                        let now = chrono::Utc::now();
+                        if let Some(c) = data.cards.iter_mut().find(|c| c.id == del_card_id) {
+                            c.deleted_at = Some(now);
+                            c.updated_at = now;
+                        }
+                        for t in &mut data.transactions {
+                            if t.card_id == del_card_id {
+                                t.deleted_at = Some(now);
+                                t.updated_at = now;
+                            }
+                        }
+                        if let Some(first) = data.cards.iter().find(|c| c.deleted_at.is_none()) {
+                            let first_id = first.id;
                             for s in &mut data.subscriptions {
                                 if s.card_id == del_card_id {
-                                    s.card_id = first.id;
+                                    s.card_id = first_id;
+                                    s.updated_at = now;
                                 }
                             }
                         }
                         if state.selected_card_id == Some(del_card_id) {
-                            state.selected_card_id = data.cards.first().map(|c| c.id);
+                            state.selected_card_id = data.cards.iter().find(|c| c.deleted_at.is_none()).map(|c| c.id);
                         }
                         *data_changed = true;
                         state.card_to_delete = None;
                     }
-
                     if ui.button("Cancel").clicked() {
                         state.card_to_delete = None;
                     }
@@ -879,7 +1202,7 @@ pub fn render_accounts_view(
                 });
 
                 ui.add_space(8.0);
-                ui.label("Date (YYYY-MM-DD):");
+                ui.label("Date (M/D/YYYY):");
                 ui.text_edit_singleline(&mut state.tx_date);
 
                 ui.add_space(6.0);
@@ -927,10 +1250,10 @@ pub fn render_accounts_view(
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui.button(RichText::new("Save Transaction").strong().color(Theme::ACCENT)).clicked() {
-                        let date = match NaiveDate::parse_from_str(state.tx_date.trim(), "%Y-%m-%d") {
-                            Ok(d) => d,
-                            Err(_) => {
-                                state.tx_error = Some("Invalid date format. Use YYYY-MM-DD.".to_string());
+                        let date = match Theme::parse_date_input(&state.tx_date) {
+                            Some(d) => d,
+                            None => {
+                                state.tx_error = Some("Invalid date format. Use M/D/YYYY (e.g. 9/4/2026).".to_string());
                                 return;
                             }
                         };
@@ -959,6 +1282,7 @@ pub fn render_accounts_view(
                             data.custom_categories.push(category.clone());
                         }
 
+                        let now = chrono::Utc::now();
                         if let Some(edit_id) = state.editing_tx_id {
                             if let Some(tx) = data.transactions.iter_mut().find(|t| t.id == edit_id) {
                                 tx.date = date;
@@ -966,6 +1290,7 @@ pub fn render_accounts_view(
                                 tx.category = category;
                                 tx.amount = amount;
                                 tx.is_income = state.tx_is_income;
+                                tx.updated_at = now;
                             }
                         } else {
                             let new_tx = Transaction {
@@ -977,6 +1302,8 @@ pub fn render_accounts_view(
                                 amount,
                                 is_income: state.tx_is_income,
                                 auto_generated: false,
+                                updated_at: now,
+                                deleted_at: None,
                             };
                             data.transactions.push(new_tx);
                         }
@@ -1006,7 +1333,7 @@ pub fn render_accounts_view(
                 ui.text_edit_singleline(&mut state.op_bal_description);
 
                 ui.add_space(6.0);
-                ui.label("Date (YYYY-MM-DD):");
+                ui.label("Date (M/D/YYYY):");
                 ui.text_edit_singleline(&mut state.op_bal_date);
 
                 ui.add_space(6.0);
@@ -1020,10 +1347,10 @@ pub fn render_accounts_view(
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui.button(RichText::new("Save").strong().color(Theme::ACCENT)).clicked() {
-                        let date = match NaiveDate::parse_from_str(state.op_bal_date.trim(), "%Y-%m-%d") {
-                            Ok(d) => d,
-                            Err(_) => {
-                                state.op_bal_error = Some("Invalid date format. Use YYYY-MM-DD.".to_string());
+                        let date = match Theme::parse_date_input(&state.op_bal_date) {
+                            Some(d) => d,
+                            None => {
+                                state.op_bal_error = Some("Invalid date format. Use M/D/YYYY (e.g. 9/4/2026).".to_string());
                                 return;
                             }
                         };
@@ -1047,6 +1374,7 @@ pub fn render_accounts_view(
                             card.opening_balance = amount;
                             card.opening_balance_description = desc;
                             card.opening_balance_date = Some(date);
+                            card.updated_at = chrono::Utc::now();
                             *data_changed = true;
                         }
                         state.show_opening_balance_modal = false;
@@ -1059,3 +1387,237 @@ pub fn render_accounts_view(
             });
     }
 }
+
+fn load_cell_val(txs: &[Transaction], tx_id: Uuid, col: SpreadsheetCol) -> String {
+    if let Some(tx) = txs.iter().find(|t| t.id == tx_id) {
+        match col {
+            SpreadsheetCol::Description => tx.description.clone(),
+            SpreadsheetCol::Category => tx.category.clone(),
+            SpreadsheetCol::MoneyIn => {
+                if tx.is_income {
+                    format!("{:.2}", tx.amount)
+                } else {
+                    String::new()
+                }
+            }
+            SpreadsheetCol::MoneyOut => {
+                if !tx.is_income {
+                    format!("{:.2}", tx.amount)
+                } else {
+                    String::new()
+                }
+            }
+        }
+    } else {
+        String::new()
+    }
+}
+
+fn commit_cell(
+    txs: &mut [Transaction],
+    tx_id: Uuid,
+    col: SpreadsheetCol,
+    val: &str,
+    data_changed: &mut bool,
+) {
+    if let Some(tx) = txs.iter_mut().find(|t| t.id == tx_id) {
+        let trimmed = val.trim();
+        match col {
+            SpreadsheetCol::Description => {
+                if !trimmed.is_empty() && tx.description != trimmed {
+                    tx.description = trimmed.to_string();
+                    tx.updated_at = chrono::Utc::now();
+                    *data_changed = true;
+                }
+            }
+            SpreadsheetCol::Category => {
+                if !trimmed.is_empty() && tx.category != trimmed {
+                    tx.category = trimmed.to_string();
+                    tx.updated_at = chrono::Utc::now();
+                    *data_changed = true;
+                }
+            }
+            SpreadsheetCol::MoneyIn => {
+                if let Some(parsed) = Theme::parse_pkr_input(trimmed) {
+                    if parsed > 0.0 {
+                        tx.amount = parsed;
+                        tx.is_income = true;
+                        if tx.category == "Other" || tx.category.is_empty() {
+                            tx.category = "Income".to_string();
+                        }
+                        tx.updated_at = chrono::Utc::now();
+                        *data_changed = true;
+                    }
+                }
+            }
+            SpreadsheetCol::MoneyOut => {
+                if let Some(parsed) = Theme::parse_pkr_input(trimmed) {
+                    if parsed > 0.0 {
+                        tx.amount = parsed;
+                        tx.is_income = false;
+                        if tx.category == "Income" {
+                            tx.category = "Other".to_string();
+                        }
+                        tx.updated_at = chrono::Utc::now();
+                        *data_changed = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_cell_keys(
+    ui: &Ui,
+    resp: &egui::Response,
+    data: &mut AppData,
+    state: &mut AccountsViewState,
+    tx_id: Uuid,
+    col: SpreadsheetCol,
+    editable_tx_ids: &[Uuid],
+    data_changed: &mut bool,
+) {
+    let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+    let tab_pressed = ui.input(|i| i.key_pressed(egui::Key::Tab));
+    let shift_held = ui.input(|i| i.modifiers.shift);
+    let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+
+    if esc_pressed {
+        state.active_edit = None;
+    } else if enter_pressed {
+        // Commit and move down one row in same column
+        commit_cell(&mut data.transactions, tx_id, col, &state.edit_str, data_changed);
+        if let Some(pos) = editable_tx_ids.iter().position(|id| *id == tx_id) {
+            if pos + 1 < editable_tx_ids.len() {
+                let next_id = editable_tx_ids[pos + 1];
+                state.active_edit = Some((next_id, col));
+                state.edit_str = load_cell_val(&data.transactions, next_id, col);
+                state.edit_just_focused = true;
+            } else {
+                state.active_edit = None;
+            }
+        } else {
+            state.active_edit = None;
+        }
+    } else if tab_pressed {
+        commit_cell(&mut data.transactions, tx_id, col, &state.edit_str, data_changed);
+        if shift_held {
+            match col {
+                SpreadsheetCol::MoneyOut => {
+                    state.active_edit = Some((tx_id, SpreadsheetCol::MoneyIn));
+                    state.edit_str = load_cell_val(&data.transactions, tx_id, SpreadsheetCol::MoneyIn);
+                    state.edit_just_focused = true;
+                }
+                SpreadsheetCol::MoneyIn => {
+                    state.active_edit = Some((tx_id, SpreadsheetCol::Category));
+                    state.edit_str = load_cell_val(&data.transactions, tx_id, SpreadsheetCol::Category);
+                    state.edit_just_focused = true;
+                }
+                SpreadsheetCol::Category => {
+                    state.active_edit = Some((tx_id, SpreadsheetCol::Description));
+                    state.edit_str = load_cell_val(&data.transactions, tx_id, SpreadsheetCol::Description);
+                    state.edit_just_focused = true;
+                }
+                SpreadsheetCol::Description => {
+                    if let Some(pos) = editable_tx_ids.iter().position(|id| *id == tx_id) {
+                        if pos > 0 {
+                            let prev_id = editable_tx_ids[pos - 1];
+                            state.active_edit = Some((prev_id, SpreadsheetCol::MoneyOut));
+                            state.edit_str = load_cell_val(&data.transactions, prev_id, SpreadsheetCol::MoneyOut);
+                            state.edit_just_focused = true;
+                        } else {
+                            state.active_edit = None;
+                        }
+                    } else {
+                        state.active_edit = None;
+                    }
+                }
+            }
+        } else {
+            match col {
+                SpreadsheetCol::Description => {
+                    state.active_edit = Some((tx_id, SpreadsheetCol::Category));
+                    state.edit_str = load_cell_val(&data.transactions, tx_id, SpreadsheetCol::Category);
+                    state.edit_just_focused = true;
+                }
+                SpreadsheetCol::Category => {
+                    state.active_edit = Some((tx_id, SpreadsheetCol::MoneyIn));
+                    state.edit_str = load_cell_val(&data.transactions, tx_id, SpreadsheetCol::MoneyIn);
+                    state.edit_just_focused = true;
+                }
+                SpreadsheetCol::MoneyIn => {
+                    state.active_edit = Some((tx_id, SpreadsheetCol::MoneyOut));
+                    state.edit_str = load_cell_val(&data.transactions, tx_id, SpreadsheetCol::MoneyOut);
+                    state.edit_just_focused = true;
+                }
+                SpreadsheetCol::MoneyOut => {
+                    if let Some(pos) = editable_tx_ids.iter().position(|id| *id == tx_id) {
+                        if pos + 1 < editable_tx_ids.len() {
+                            let next_id = editable_tx_ids[pos + 1];
+                            state.active_edit = Some((next_id, SpreadsheetCol::Description));
+                            state.edit_str = load_cell_val(&data.transactions, next_id, SpreadsheetCol::Description);
+                            state.edit_just_focused = true;
+                        } else {
+                            state.active_edit = None;
+                        }
+                    } else {
+                        state.active_edit = None;
+                    }
+                }
+            }
+        }
+    } else if resp.lost_focus() && !state.edit_just_focused {
+        commit_cell(&mut data.transactions, tx_id, col, &state.edit_str, data_changed);
+        state.active_edit = None;
+    }
+}
+
+/// Sorts transactions on the same date for a card so that spendings appear before incomes,
+/// preserving relative order within spending and within income.
+pub fn sort_spending_first_on_same_date(data: &mut AppData, card_id: Uuid) -> bool {
+    let now = chrono::Utc::now();
+    let mut changed = false;
+
+    // Collect all transaction indices for this card (non-deleted)
+    let card_tx_indices: Vec<usize> = data.transactions
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.card_id == card_id && t.deleted_at.is_none())
+        .map(|(i, _)| i)
+        .collect();
+
+    // Group indices by date
+    let mut date_groups: std::collections::BTreeMap<chrono::NaiveDate, Vec<usize>> = std::collections::BTreeMap::new();
+    for idx in card_tx_indices {
+        date_groups.entry(data.transactions[idx].date).or_default().push(idx);
+    }
+
+    for (_date, indices) in date_groups {
+        if indices.len() <= 1 {
+            continue;
+        }
+
+        // We want spending (!is_income) first, income (is_income) second, stable.
+        let mut sorted_indices = indices.clone();
+        sorted_indices.sort_by_key(|&idx| {
+            if data.transactions[idx].is_income { 1 } else { 0 }
+        });
+
+        if sorted_indices != indices {
+            changed = true;
+            let items: Vec<Transaction> = sorted_indices.iter().map(|&i| {
+                let mut tx = data.transactions[i].clone();
+                tx.updated_at = now;
+                tx
+            }).collect();
+
+            for (slot, item) in indices.iter().zip(items.into_iter()) {
+                data.transactions[*slot] = item;
+            }
+        }
+    }
+
+    changed
+}
+

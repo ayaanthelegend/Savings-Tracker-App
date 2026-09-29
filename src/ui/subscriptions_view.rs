@@ -1,8 +1,9 @@
 use crate::models::{AppData, BillingCycle, Subscription};
 use crate::subscriptions::SubscriptionManager;
 use crate::ui::theme::Theme;
-use chrono::{Local, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate};
 use egui::{Align, Layout, RichText, Rounding, Ui, Vec2};
+use egui_plot::{Bar, BarChart, Plot};
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -28,7 +29,7 @@ impl SubscriptionsViewState {
         self.amount.clear();
         self.cycle_type = 0;
         self.custom_days = "30".to_string();
-        self.start_date = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        self.start_date = Theme::format_input_date(&Local::now().date_naive());
         self.linked_card_id = default_card_id;
         self.modal_error = None;
     }
@@ -52,7 +53,7 @@ impl SubscriptionsViewState {
                 self.custom_days = days.to_string();
             }
         }
-        self.start_date = sub.start_date.format("%Y-%m-%d").to_string();
+        self.start_date = Theme::format_input_date(&sub.start_date);
         self.linked_card_id = Some(sub.card_id);
         self.modal_error = None;
     }
@@ -67,7 +68,7 @@ pub fn render_subscriptions_view(
     let today = Local::now().date_naive();
     let total_monthly = SubscriptionManager::total_monthly_cost(&data.subscriptions, None);
     let total_yearly = total_monthly * 12.0;
-    let active_count = data.subscriptions.iter().filter(|s| !s.paused).count();
+    let active_count = data.subscriptions.iter().filter(|s| s.deleted_at.is_none() && !s.paused).count();
 
     let avail_width = (ui.available_width() - 2.0 * Theme::PAGE_MARGIN).max(0.0);
     let content_width = avail_width.min(Theme::CONTENT_MAX_WIDTH);
@@ -91,25 +92,119 @@ pub fn render_subscriptions_view(
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(RichText::new("Total monthly cost (prorated)").font(Theme::font_sans(11.5)).color(Theme::MUTED));
+                            ui.label(RichText::new("Total monthly (prorated)").font(Theme::font_sans(11.5)).color(Theme::MUTED));
                             Theme::render_mono(ui, &Theme::format_pkr(total_monthly), Theme::ACCENT, 16.0);
                         });
 
-                        ui.add_space(32.0);
+                        ui.add_space(28.0);
+
+                        let monthly_reserve_needed = SubscriptionManager::annual_reserve_monthly_needed(&data.subscriptions, None);
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new("Monthly reserve needed").font(Theme::font_sans(11.5)).color(Theme::MUTED));
+                            Theme::render_mono(ui, &Theme::format_pkr(monthly_reserve_needed), Theme::CAT_SUBSCRIPTION, 16.0);
+                        });
+
+                        ui.add_space(28.0);
 
                         ui.vertical(|ui| {
                             ui.label(RichText::new("Annual commitment").font(Theme::font_sans(11.5)).color(Theme::MUTED));
                             Theme::render_mono(ui, &Theme::format_pkr(total_yearly), Theme::TEXT, 16.0);
                         });
 
-                        ui.add_space(32.0);
+                        ui.add_space(28.0);
 
+                        let yearly_subs_count = data.subscriptions.iter().filter(|s| s.deleted_at.is_none() && !s.paused && s.cycle == BillingCycle::Yearly).count();
                         ui.vertical(|ui| {
                             ui.label(RichText::new("Active recurring").font(Theme::font_sans(11.5)).color(Theme::MUTED));
                             ui.label(
-                                RichText::new(format!("{} active ({} total)", active_count, data.subscriptions.len()))
+                                RichText::new(format!("{} active ({} annual)", active_count, yearly_subs_count))
                                     .font(Theme::font_sans(14.0))
                                     .color(Theme::TEXT),
+                            );
+                        });
+                    });
+                });
+        });
+    });
+
+    ui.add_space(Theme::CARD_GAP);
+
+    // 2. 12-Month Cost Trend Chart (Section 5 & 7.4: full width, ~120px tall)
+    ui.horizontal(|ui| {
+        ui.add_space(side_margin);
+        ui.vertical(|ui| {
+            ui.set_width(content_width);
+            ui.set_max_width(content_width);
+
+            egui::Frame::none()
+                .fill(Theme::PANEL)
+                .stroke(Theme::stroke_border())
+                .rounding(Rounding::same(Theme::RADIUS_CARD))
+                .inner_margin(egui::Margin::symmetric(20.0, 12.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+
+                    let first_month_date = today.checked_sub_months(chrono::Months::new(11)).unwrap_or(today);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("12-Month Cost Trend")
+                                .font(Theme::font_sans(12.0))
+                                .color(Theme::MUTED),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("Current: {} / mo", Theme::format_pkr(total_monthly)))
+                                    .font(Theme::font_mono(12.0))
+                                    .color(Theme::ACCENT),
+                            );
+                        });
+                    });
+
+                    ui.add_space(6.0);
+
+                    // Compute prorated monthly cost over trailing 12 months
+                    let mut bars = Vec::with_capacity(12);
+                    for i in 0..12 {
+                        let m_date = today.checked_sub_months(chrono::Months::new(11 - i)).unwrap_or(today);
+                        let m_start = NaiveDate::from_ymd_opt(m_date.year(), m_date.month(), 1).unwrap();
+                        let next_m_date = m_start.checked_add_months(chrono::Months::new(1)).unwrap_or(m_start);
+                        let m_end = next_m_date - chrono::Duration::days(1);
+
+                        let mut cost_for_m = 0.0;
+                        for sub in data.subscriptions.iter().filter(|s| s.deleted_at.is_none()) {
+                            if sub.start_date <= m_end {
+                                cost_for_m += SubscriptionManager::monthly_cost(sub);
+                            }
+                        }
+                        bars.push(Bar::new(i as f64, cost_for_m).width(0.55));
+                    }
+
+                    let chart = BarChart::new(bars).color(Theme::ACCENT);
+
+                    Plot::new("sub_cost_trend_plot")
+                        .height(75.0)
+                        .allow_drag(false)
+                        .allow_zoom(false)
+                        .allow_scroll(false)
+                        .show_axes([false, false])
+                        .show_grid([false, true])
+                        .show(ui, |plot_ui| {
+                            plot_ui.bar_chart(chart);
+                        });
+
+                    // First / last month labels at each end in --muted text
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(first_month_date.format("%b %Y").to_string())
+                                .font(Theme::font_sans(11.0))
+                                .color(Theme::MUTED),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(today.format("%b %Y").to_string())
+                                    .font(Theme::font_sans(11.0))
+                                    .color(Theme::MUTED),
                             );
                         });
                     });
@@ -129,14 +224,14 @@ pub fn render_subscriptions_view(
 
                 let mut sub_to_edit = None;
 
-                for sub in &mut data.subscriptions {
+                for sub in data.subscriptions.iter_mut().filter(|s| s.deleted_at.is_none()) {
                     let card_frame = egui::Frame::none()
                         .fill(Theme::PANEL)
                         .stroke(Theme::stroke_border())
                         .rounding(Rounding::same(Theme::RADIUS_CARD))
                         .inner_margin(egui::Margin::symmetric(20.0, Theme::CARD_PADDING));
 
-                    card_frame.show(ui, |ui| {
+                    let card_resp = card_frame.show(ui, |ui| {
                         ui.set_width(ui.available_width());
 
                         // Row 1: Name (.nm: Space Grotesk 15px bold) and Status
@@ -190,6 +285,70 @@ pub fn render_subscriptions_view(
                                 .color(if days_until <= 3 && !sub.paused { Theme::OUT } else { Theme::MUTED }),
                         );
 
+                        // Yearly Sinking Fund Reserve Breakdown
+                        if let Some(info) = SubscriptionManager::yearly_reserve_status(sub, today) {
+                            ui.add_space(8.0);
+                            egui::Frame::none()
+                                .fill(Theme::PANEL2)
+                                .stroke(Theme::stroke_border())
+                                .rounding(Rounding::same(Theme::RADIUS_SM))
+                                .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new("🛡 Sinking Fund Reserve")
+                                                .font(Theme::font_sans(12.0))
+                                                .strong()
+                                                .color(Theme::CAT_SUBSCRIPTION),
+                                        );
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.label(
+                                                RichText::new(format!("Set aside {} / mo", Theme::format_pkr_whole(info.monthly_reserve)))
+                                                    .font(Theme::font_sans(11.5))
+                                                    .color(Theme::MUTED),
+                                            );
+                                        });
+                                    });
+
+                                    ui.add_space(6.0);
+
+                                    // Visual Progress bar
+                                    let progress_ratio = info.progress_ratio.clamp(0.0, 1.0);
+                                    let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), egui::Sense::hover());
+                                    ui.painter().rect_filled(bar_rect, Rounding::same(3.0), Theme::PANEL);
+                                    if progress_ratio > 0.0 {
+                                        let fill_w = bar_rect.width() * progress_ratio;
+                                        let fill_rect = egui::Rect::from_min_size(bar_rect.left_top(), Vec2::new(fill_w, bar_rect.height()));
+                                        ui.painter().rect_filled(fill_rect, Rounding::same(3.0), Theme::CAT_SUBSCRIPTION);
+                                    }
+
+                                    ui.add_space(6.0);
+
+                                    // Countdown & Accumulated Savings Text
+                                    ui.horizontal(|ui| {
+                                        let countdown_text = format!(
+                                            "Saved {} / {} · {}",
+                                            Theme::format_pkr_whole(info.saved_amount),
+                                            Theme::format_pkr_whole(info.total_cost),
+                                            info.due_text
+                                        );
+                                        ui.label(
+                                            RichText::new(countdown_text)
+                                                .font(Theme::font_sans(12.0))
+                                                .color(Theme::TEXT),
+                                        );
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.label(
+                                                RichText::new(format!("{:.0}% funded", progress_ratio * 100.0))
+                                                    .font(Theme::font_mono(11.0))
+                                                    .color(if progress_ratio >= 1.0 { Theme::IN } else { Theme::CAT_SUBSCRIPTION }),
+                                            );
+                                        });
+                                    });
+                                });
+                        }
+
                         ui.add_space(6.0);
 
                         // Row 4: Actions bar
@@ -203,6 +362,7 @@ pub fn render_subscriptions_view(
                             let pause_text = if sub.paused { "Resume" } else { "Pause" };
                             if ui.link(RichText::new(pause_text).font(Theme::font_sans(12.0)).color(Theme::FAINT)).clicked() {
                                 sub.paused = !sub.paused;
+                                sub.updated_at = chrono::Utc::now();
                                 *data_changed = true;
                             }
 
@@ -213,6 +373,18 @@ pub fn render_subscriptions_view(
                             });
                         });
                     });
+
+                    // 3px top accent bar per Section 1.4 & 7.4
+                    let card_color = if sub.name.to_lowercase().contains("food") || sub.name.to_lowercase().contains("meal") {
+                        Theme::category_color("Food")
+                    } else if sub.name.to_lowercase().contains("gym") || sub.name.to_lowercase().contains("transport") {
+                        Theme::category_color("Transport")
+                    } else if sub.name.to_lowercase().contains("shop") {
+                        Theme::category_color("Shopping")
+                    } else {
+                        Theme::BORDER
+                    };
+                    Theme::paint_card_accent_bar(ui.painter(), card_resp.response.rect, card_color, Theme::RADIUS_CARD);
 
                     ui.add_space(Theme::CARD_GAP);
                 }
@@ -265,7 +437,11 @@ pub fn render_subscriptions_view(
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button(RichText::new("Delete").color(Theme::EXPENSE).strong()).clicked() {
-                        data.subscriptions.retain(|s| s.id != del_id);
+                        let now = chrono::Utc::now();
+                        if let Some(s) = data.subscriptions.iter_mut().find(|s| s.id == del_id) {
+                            s.deleted_at = Some(now);
+                            s.updated_at = now;
+                        }
                         *data_changed = true;
                         state.sub_to_delete = None;
                     }
@@ -312,7 +488,7 @@ pub fn render_subscriptions_view(
                 }
 
                 ui.add_space(6.0);
-                ui.label("Start Date (YYYY-MM-DD):");
+                ui.label("Start Date (M/D/YYYY):");
                 ui.text_edit_singleline(&mut state.start_date);
 
                 ui.add_space(6.0);
@@ -354,10 +530,10 @@ pub fn render_subscriptions_view(
                             }
                         };
 
-                        let start_date = match NaiveDate::parse_from_str(state.start_date.trim(), "%Y-%m-%d") {
-                            Ok(d) => d,
-                            Err(_) => {
-                                state.modal_error = Some("Invalid start date. Use YYYY-MM-DD.".to_string());
+                        let start_date = match Theme::parse_date_input(&state.start_date) {
+                            Some(d) => d,
+                            None => {
+                                state.modal_error = Some("Invalid start date. Use M/D/YYYY (e.g. 9/4/2026).".to_string());
                                 return;
                             }
                         };
@@ -384,6 +560,7 @@ pub fn render_subscriptions_view(
 
                         let next_due = SubscriptionManager::advance_date(start_date, &cycle);
 
+                        let now = chrono::Utc::now();
                         if let Some(sub_id) = state.editing_sub_id {
                             if let Some(sub) = data.subscriptions.iter_mut().find(|s| s.id == sub_id) {
                                 sub.name = name;
@@ -392,6 +569,7 @@ pub fn render_subscriptions_view(
                                 sub.start_date = start_date;
                                 sub.next_due_date = next_due;
                                 sub.card_id = card_id;
+                                sub.updated_at = now;
                             }
                         } else {
                             let new_sub = Subscription {
@@ -403,6 +581,8 @@ pub fn render_subscriptions_view(
                                 start_date,
                                 next_due_date: next_due,
                                 paused: false,
+                                updated_at: now,
+                                deleted_at: None,
                             };
                             data.subscriptions.push(new_sub);
                         }

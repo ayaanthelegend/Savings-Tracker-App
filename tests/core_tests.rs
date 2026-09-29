@@ -147,6 +147,8 @@ fn test_ledger_running_balance_chronological() {
         opening_balance: 50_000.0,
         opening_balance_description: "Opening Balance".to_string(),
         opening_balance_date: None,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     };
 
     let tx1 = Transaction {
@@ -158,6 +160,8 @@ fn test_ledger_running_balance_chronological() {
         amount: 5_000.0,
         is_income: false,
         auto_generated: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     };
 
     let tx2 = Transaction {
@@ -169,6 +173,8 @@ fn test_ledger_running_balance_chronological() {
         amount: 25_000.0,
         is_income: true,
         auto_generated: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     };
 
     let tx3 = Transaction {
@@ -180,6 +186,8 @@ fn test_ledger_running_balance_chronological() {
         amount: 10_000.0,
         is_income: false,
         auto_generated: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     };
 
     // Pass in random order to ensure chronological sorting works
@@ -244,6 +252,8 @@ fn test_opening_balance_single_anchor_row_regression() {
         opening_balance: 10_500.50,
         opening_balance_description: "Opening Balance".to_string(),
         opening_balance_date: Some(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap()),
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     };
 
     let empty_txs: Vec<Transaction> = Vec::new();
@@ -265,6 +275,8 @@ fn test_opening_balance_single_anchor_row_regression() {
         amount: 5000.0,
         is_income: true,
         auto_generated: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     };
     let rows_with_tx = LedgerCalculator::compute_full_ledger(&card, &[tx]);
     assert_eq!(rows_with_tx.len(), 2);
@@ -295,6 +307,8 @@ fn test_subscription_cycle_advancement_and_proration() {
         start_date: base_date,
         next_due_date: next_monthly,
         paused: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     };
     assert_eq!(SubscriptionManager::monthly_cost(&spotify), 400.0);
 
@@ -307,6 +321,8 @@ fn test_subscription_cycle_advancement_and_proration() {
         start_date: base_date,
         next_due_date: next_yearly,
         paused: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     };
     assert_eq!(SubscriptionManager::monthly_cost(&hbo), 700.0); // 8400 / 12 = 700
 }
@@ -329,6 +345,8 @@ fn test_subscription_missed_due_date_catchup() {
         start_date: past_due,
         next_due_date: past_due,
         paused: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     });
 
     let notices = SubscriptionManager::process_due_subscriptions(&mut data, today);
@@ -398,6 +416,9 @@ fn test_savings_plan_progress_and_surplus_tracking() {
         closed_at: None,
         final_saved: None,
         goal_met: None,
+        deduct_overspending: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     };
 
     // Actual spending of 30,000 in September
@@ -410,6 +431,8 @@ fn test_savings_plan_progress_and_surplus_tracking() {
         amount: 30_000.0,
         is_income: false,
         auto_generated: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     };
 
     let calc = SavingsEngine::compute_progress(&plan, &[tx1], 0.0, today, false);
@@ -463,6 +486,8 @@ fn test_checklist_requirements_integration() {
         opening_balance: parsed_op.unwrap(),
         opening_balance_description: "Opening Balance".to_string(),
         opening_balance_date: None,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     };
 
     let empty_txs: Vec<Transaction> = Vec::new();
@@ -494,6 +519,8 @@ fn test_checklist_requirements_integration() {
         amount: 8000.0,
         is_income: true,
         auto_generated: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     };
 
     let tx_september = Transaction {
@@ -505,6 +532,8 @@ fn test_checklist_requirements_integration() {
         amount: 3000.0,
         is_income: false,
         auto_generated: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
     };
 
     // Pass in reverse order to verify chronological sorting
@@ -530,3 +559,261 @@ fn test_checklist_requirements_integration() {
     let past_deadline = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
     assert!(past_deadline <= today); // Verifies condition used to reject past deadline
 }
+
+#[test]
+fn test_date_formatting_and_parsing_m_d_yyyy() {
+    let date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+    
+    // User requirement: input format is 9/4/2026
+    assert_eq!(Theme::format_input_date(&date), "9/4/2026");
+    
+    // User requirement: display format is 4 Sep 2026
+    assert_eq!(Theme::format_date(&date), "4 Sep 2026");
+    
+    // Parsing user input formats
+    assert_eq!(Theme::parse_date_input("9/4/2026"), Some(date));
+    assert_eq!(Theme::parse_date_input("09/04/2026"), Some(date));
+    assert_eq!(Theme::parse_date_input("2026-09-04"), Some(date));
+    assert_eq!(Theme::parse_date_input("4 Sep 2026"), Some(date));
+    assert_eq!(Theme::parse_date_input("9-4-2026"), Some(date));
+}
+
+#[test]
+fn test_same_date_transaction_reordering_and_running_balance() {
+    let card_id = Uuid::new_v4();
+    let card = Card {
+        id: card_id,
+        name: "Test Bank".to_string(),
+        is_primary: true,
+        opening_balance: 10000.0,
+        opening_balance_description: "Opening Balance".to_string(),
+        opening_balance_date: Some(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap()),
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
+    };
+
+    let date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+    let tx_income = Transaction {
+        id: Uuid::new_v4(),
+        card_id,
+        date,
+        description: "Salary deposit".to_string(),
+        category: "Income".to_string(),
+        amount: 5000.0,
+        is_income: true,
+        auto_generated: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
+    };
+
+    let tx_expense = Transaction {
+        id: Uuid::new_v4(),
+        card_id,
+        date,
+        description: "Groceries".to_string(),
+        category: "Food".to_string(),
+        amount: 2000.0,
+        is_income: false,
+        auto_generated: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
+    };
+
+    // Case 1: Income first in array -> running balance increases to 15,000 then drops to 13,000
+    let txs_case1 = vec![tx_income.clone(), tx_expense.clone()];
+    let ledger1 = LedgerCalculator::compute_full_ledger(&card, &txs_case1);
+    assert_eq!(ledger1.len(), 3);
+    assert_eq!(ledger1[1].description, "Salary deposit");
+    assert_eq!(ledger1[1].running_balance, 15000.0);
+    assert_eq!(ledger1[2].description, "Groceries");
+    assert_eq!(ledger1[2].running_balance, 13000.0);
+
+    // Case 2: Expense first in array (user rearranged) -> drops to 8,000 then increases to 13,000
+    let txs_case2 = vec![tx_expense.clone(), tx_income.clone()];
+    let ledger2 = LedgerCalculator::compute_full_ledger(&card, &txs_case2);
+    assert_eq!(ledger2.len(), 3);
+    assert_eq!(ledger2[1].description, "Groceries");
+    assert_eq!(ledger2[1].running_balance, 8000.0);
+    assert_eq!(ledger2[2].description, "Salary deposit");
+    assert_eq!(ledger2[2].running_balance, 13000.0);
+}
+
+#[test]
+fn test_yearly_reserve_sinking_fund() {
+    let today = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let card_id = Uuid::new_v4();
+
+    // 1. Subscription Rs 12,000 / year renewing in 6 months (approx 182 days: March 1, 2027)
+    let sub_6mo = Subscription {
+        id: Uuid::new_v4(),
+        name: "Amazon Prime".to_string(),
+        amount: 12000.0,
+        cycle: BillingCycle::Yearly,
+        card_id,
+        start_date: today,
+        next_due_date: NaiveDate::from_ymd_opt(2027, 3, 1).unwrap(),
+        paused: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
+    };
+
+    let status_6mo = SubscriptionManager::yearly_reserve_status(&sub_6mo, today).unwrap();
+    assert_eq!(status_6mo.total_cost, 12000.0);
+    assert_eq!(status_6mo.monthly_reserve, 1000.0);
+    assert_eq!(status_6mo.months_remaining, 6);
+    assert_eq!(status_6mo.months_accumulated, 6);
+    assert_eq!(status_6mo.saved_amount, 6000.0);
+    assert!((status_6mo.progress_ratio - 0.5).abs() < 0.01);
+    assert_eq!(status_6mo.due_text, "Due in 6 months");
+
+    // 2. Subscription Rs 24,000 / year due in 1 month (October 1, 2026: 30 days)
+    let sub_1mo = Subscription {
+        id: Uuid::new_v4(),
+        name: "Software License".to_string(),
+        amount: 24000.0,
+        cycle: BillingCycle::Yearly,
+        card_id,
+        start_date: today,
+        next_due_date: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+        paused: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
+    };
+
+    let status_1mo = SubscriptionManager::yearly_reserve_status(&sub_1mo, today).unwrap();
+    assert_eq!(status_1mo.monthly_reserve, 2000.0);
+    assert_eq!(status_1mo.months_remaining, 1);
+    assert_eq!(status_1mo.months_accumulated, 11);
+    assert_eq!(status_1mo.saved_amount, 22000.0);
+    assert_eq!(status_1mo.due_text, "Due in 1 month");
+
+    // 3. Subscription due today
+    let sub_today = Subscription {
+        id: Uuid::new_v4(),
+        name: "Domain Registration".to_string(),
+        amount: 3600.0,
+        cycle: BillingCycle::Yearly,
+        card_id,
+        start_date: today,
+        next_due_date: today,
+        paused: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
+    };
+
+    let status_today = SubscriptionManager::yearly_reserve_status(&sub_today, today).unwrap();
+    assert_eq!(status_today.months_remaining, 0);
+    assert_eq!(status_today.months_accumulated, 12);
+    assert_eq!(status_today.saved_amount, 3600.0);
+    assert_eq!(status_today.progress_ratio, 1.0);
+    assert_eq!(status_today.due_text, "Due today");
+
+    // Test annual_reserve_monthly_needed: ignores paused, deleted, or monthly cycles
+    let monthly_sub = Subscription {
+        id: Uuid::new_v4(),
+        name: "Spotify".to_string(),
+        amount: 500.0,
+        cycle: BillingCycle::Monthly,
+        card_id,
+        start_date: today,
+        next_due_date: NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+        paused: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
+    };
+
+    let paused_sub = Subscription {
+        id: Uuid::new_v4(),
+        name: "Paused Annual".to_string(),
+        amount: 12000.0,
+        cycle: BillingCycle::Yearly,
+        card_id,
+        start_date: today,
+        next_due_date: NaiveDate::from_ymd_opt(2027, 3, 1).unwrap(),
+        paused: true,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
+    };
+
+    let all_subs = vec![
+        sub_6mo.clone(),
+        sub_1mo.clone(),
+        sub_today.clone(),
+        monthly_sub,
+        paused_sub,
+    ];
+
+    // Sinking fund monthly reserve needed = (12,000 / 12) + (24,000 / 12) + (3,600 / 12) = 1,000 + 2,000 + 300 = 3,300
+    let monthly_needed = SubscriptionManager::annual_reserve_monthly_needed(&all_subs, None);
+    assert_eq!(monthly_needed, 3300.0);
+
+    // Total accumulated reserve = 6,000 + 22,000 + 3,600 = 31,600
+    let total_accumulated = SubscriptionManager::total_accumulated_annual_reserve(&all_subs, today, None);
+    assert_eq!(total_accumulated, 31600.0);
+}
+
+#[test]
+fn test_sinking_fund_savings_plan_deduction() {
+    let today = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let deadline = NaiveDate::from_ymd_opt(2027, 9, 1).unwrap(); // 12 months away
+    let card_id = Uuid::new_v4();
+
+    // Yearly subscription of 12,000/year (1,000/month prorated reserve)
+    let yearly_sub = Subscription {
+        id: Uuid::new_v4(),
+        name: "Annual Insurance".to_string(),
+        amount: 12000.0,
+        cycle: BillingCycle::Yearly,
+        card_id,
+        start_date: today,
+        next_due_date: NaiveDate::from_ymd_opt(2027, 3, 1).unwrap(),
+        paused: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
+    };
+
+    // Monthly subscription of 2,000/month
+    let monthly_sub = Subscription {
+        id: Uuid::new_v4(),
+        name: "Internet".to_string(),
+        amount: 2000.0,
+        cycle: BillingCycle::Monthly,
+        card_id,
+        start_date: today,
+        next_due_date: NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+        paused: false,
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
+    };
+
+    let subs = vec![yearly_sub, monthly_sub];
+
+    // Total monthly cost incorporates prorated yearly (1,000) + monthly (2,000) = 3,000
+    let total_sub_cost = SubscriptionManager::total_monthly_cost(&subs, None);
+    assert_eq!(total_sub_cost, 3000.0);
+
+    // Savings plan:
+    // Income: 100,000 / month
+    // Target: 240,000 over 12 months = 20,000 / month target savings
+    // Spending limit = Income (100,000) - Target Savings (20,000) - Prorated Subscriptions (3,000) = 77,000
+    let target_amount = 240000.0;
+    let monthly_income = 100000.0;
+
+    let (_months_remaining, required_savings, recommended_limit, effective_limit, is_feasible, _shortage) =
+        SavingsEngine::evaluate_plan_metrics(
+            today,
+            target_amount,
+            deadline,
+            monthly_income,
+            None,
+            total_sub_cost,
+        );
+
+    assert!(is_feasible);
+    assert!((required_savings - 20000.0).abs() < 50.0);
+    // Spending limit has the 1,000 annual reserve + 2,000 monthly subscription automatically deducted!
+    assert!((recommended_limit - 77000.0).abs() < 50.0);
+    assert_eq!(recommended_limit, effective_limit);
+}
+
+
