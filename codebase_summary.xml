@@ -1,0 +1,296 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<codebase>
+  <metadata>
+    <name>Savings Tracker</name>
+    <version>0.1.0</version>
+    <edition>2021</edition>
+    <language>Rust</language>
+    <platform>Windows (x86_64)</platform>
+    <description>
+      A high-performance, standalone Windows desktop application for personal finance management,
+      featuring multi-card bank ledgers with running balances, recurring subscription tracking with
+      automated due-date catchup, savings plans with feasibility metrics, and native Windows toast notifications.
+    </description>
+    <entry_point>src/main.rs</entry_point>
+    <target_binary>target/release/savings_tracker.exe</target_binary>
+    <ui_framework>egui / eframe (v0.29)</ui_framework>
+  </metadata>
+
+  <dependencies>
+    <dependency name="eframe" version="0.29">Immediate-mode desktop GUI framework runner</dependency>
+    <dependency name="egui" version="0.29">Immediate-mode graphical user interface library</dependency>
+    <dependency name="egui_extras" version="0.29" features="all_loaders">Advanced UI controls including TableBuilder for spreadsheets</dependency>
+    <dependency name="serde" version="1.0" features="derive">Serialization and deserialization framework</dependency>
+    <dependency name="serde_json" version="1.0">JSON storage serialization</dependency>
+    <dependency name="chrono" version="0.4" features="serde">Date and time arithmetic and calendar calculations</dependency>
+    <dependency name="uuid" version="1.10" features="v4, serde">Unique entity identification</dependency>
+    <dependency name="dirs" version="5.0">Standard operating system directory paths resolution</dependency>
+    <dependency name="anyhow" version="1.0">Idiomatic error handling and context propagation</dependency>
+    <dependency name="windows" version="0.58" features="Data_Xml_Dom, UI_Notifications">
+      Native Windows Runtime (WinRT) APIs for interactive OS toast notifications
+    </dependency>
+  </dependencies>
+
+  <architecture>
+    <pattern>Immediate Mode GUI (IMGUI)</pattern>
+    <overview>
+      Built around an immediate-mode UI paradigm where state is rendered and updated synchronously on every frame.
+      State modifications trigger atomic disk persistence. The ledger engine computes running balances on demand
+      from opening balances and chronological transactions, preventing state drift.
+    </overview>
+    <key_subsystems>
+      <subsystem name="Storage Layer">
+        Silent, atomic JSON persistence to %APPDATA%\SavingsTracker\data.json using write-to-temp-and-rename semantics.
+      </subsystem>
+      <subsystem name="Ledger Engine">
+        Chronological ordering and running balance computation with dynamic filtering (period, category, text search).
+      </subsystem>
+      <subsystem name="Subscription Catchup Engine">
+        Automated time-travel catchup: advances overdue subscriptions and posts matching Money Out transactions when app launches.
+      </subsystem>
+      <subsystem name="Savings Engine">
+        Surplus evaluation, income vs expense feasibility calculations, overspending deduction, and deadline monitoring.
+      </subsystem>
+      <subsystem name="Notification Subsystem">
+        Dual-layer Windows notification pipeline (primary: Windows Runtime WinRT COM APIs; fallback: headless PowerShell script).
+      </subsystem>
+      <subsystem name="Typography and Design System">
+        Embedded typography with Space Grotesk (headings), Inter (proportional body), and IBM Plex Mono (tabular monetary figures).
+      </subsystem>
+    </key_subsystems>
+  </architecture>
+
+  <directory_structure>
+    <entry type="directory" path="src">Source code for core engine, models, and UI</entry>
+    <entry type="directory" path="src/ui">User interface components, view controllers, and styling theme</entry>
+    <entry type="directory" path="assets/fonts">Embedded TTF font binaries (SpaceGrotesk, Inter, IBMPlexMono)</entry>
+    <entry type="directory" path="tests">Integration and unit tests verifying domain engines</entry>
+    <entry type="file" path="Cargo.toml">Cargo package configuration, profiles, and dependencies</entry>
+    <entry type="file" path="README.md">Project overview, build instructions, and design documentation</entry>
+  </directory_structure>
+
+  <modules>
+    <module file="src/main.rs">
+      <role>Application Entry Point and Window Initialization</role>
+      <description>
+        Sets up Windows subsystem flags to hide the console terminal in release builds. Initializes the eframe window,
+        registers custom font definitions, defines text style font-size mappings, configures dark visuals, and boots
+        SavingsTrackerApp.
+      </description>
+      <functions>
+        <function name="main">Entry point configuring NativeOptions, FontDefinitions, and running eframe::run_native.</function>
+      </functions>
+    </module>
+
+    <module file="src/models.rs">
+      <role>Domain Entities and Data Structures</role>
+      <description>
+        Defines all core business entities serialized to JSON. Includes default seed data for fresh installations.
+      </description>
+      <types>
+        <type name="Card">Bank/credit card account with UUID, name, is_primary flag, and opening balance.</type>
+        <type name="Transaction">Income or expense record with card ID, date, category, amount, and auto_generated tag.</type>
+        <type name="BillingCycle">Enum for recurrence: Monthly, Yearly, CustomDays(u32).</type>
+        <type name="Subscription">Recurring cost item linked to a card with next due date and pause status.</type>
+        <type name="SavingsPlan">Financial goal with target, deadline, income, spending limits, and completion status.</type>
+        <type name="AppData">Root application state containing cards, transactions, subscriptions, plans, and categories.</type>
+      </types>
+    </module>
+
+    <module file="src/storage.rs">
+      <role>Atomic Persistence Layer</role>
+      <description>
+        Manages loading and saving AppData from %APPDATA%\SavingsTracker\data.json. Employs atomic temp-file write
+        and rename to ensure zero corruption on power outage or sudden termination.
+      </description>
+      <structs>
+        <struct name="StorageManager">Handles file system operations, directory creation, serialization, and deserialization.</struct>
+      </structs>
+      <methods>
+        <method name="new">Resolves app data path and creates directory if missing.</method>
+        <method name="load">Reads data.json or seeds default data if file is absent or corrupted.</method>
+        <method name="save">Serializes pretty JSON to a .tmp file, flushes to disk, and atomically renames to target.</method>
+      </methods>
+    </module>
+
+    <module file="src/ledger.rs">
+      <role>Ledger and Running Balance Calculation Engine</role>
+      <description>
+        Calculates chronological running balances per card starting from opening balance, and filters/sorts ledger rows
+        based on active search queries, categories, and date ranges.
+      </description>
+      <structs>
+        <struct name="LedgerRow">Renderable table row with money_in, money_out, running_balance, and opening balance flags.</struct>
+        <struct name="LedgerCalculator">Stateless utility computing and filtering full card ledgers.</struct>
+      </structs>
+      <methods>
+        <method name="compute_full_ledger">Chronologically sorts transactions and computes sequential running balance.</method>
+        <method name="filter_and_sort_ledger">Filters rows by date range, category, and substring search, supporting reverse sort.</method>
+      </methods>
+    </module>
+
+    <module file="src/subscriptions.rs">
+      <role>Subscription Management and Automated Catchup</role>
+      <description>
+        Calculates prorated monthly costs, advances billing cycles, and automatically catches up missed payment dates
+        by recording Money Out transactions when the application launches.
+      </description>
+      <structs>
+        <struct name="SubscriptionManager">Stateless helper for cycle math, proration, and due date resolution.</struct>
+      </structs>
+      <methods>
+        <method name="advance_date">Calculates the next due date based on Monthly, Yearly, or CustomDays cycle.</method>
+        <method name="monthly_cost">Computes normalized monthly cost (divides yearly by 12, scales custom days).</method>
+        <method name="total_monthly_cost">Aggregates prorated monthly commitments across all or selected cards.</method>
+        <method name="process_due_subscriptions">Loops through overdue active subscriptions, creates ledger expenses, and advances dates.</method>
+      </methods>
+    </module>
+
+    <module file="src/savings.rs">
+      <role>Savings Plan Calculations and Expiration Tracking</role>
+      <description>
+        Evaluates financial feasibility of target savings against monthly income and subscription burdens. Tracks monthly
+        spending vs recommended limits to calculate historical surplus and triggers toast notifications on plan deadline.
+      </description>
+      <structs>
+        <struct name="MonthBreakdown">Monthly breakdown of income, spending limit, actual spending, and surplus/deficit.</struct>
+        <struct name="PlanCalculation">Computed plan progress, required monthly savings, feasibility status, and projected shortage.</struct>
+        <struct name="SavingsEngine">Engine for metric evaluation, historical progress tracking, and deadline expiration handling.</struct>
+      </structs>
+      <methods>
+        <method name="calculate_months_remaining">Computes normalized months remaining until deadline.</method>
+        <method name="evaluate_plan_metrics">Calculates required monthly savings and recommended discretionary spending limit.</method>
+        <method name="compute_progress">Evaluates actual monthly expenditures from linked cards against plan limits.</method>
+        <method name="check_expirations">Checks active plans against system date, archives expired plans, and triggers toast notifications.</method>
+      </methods>
+    </module>
+
+    <module file="src/notification.rs">
+      <role>Native Windows Toast Notifications</role>
+      <description>
+        Dispatches native Windows 10/11 toast notifications. Uses windows-rs WinRT APIs directly, with a silent fallback
+        to headless PowerShell invocation for maximum cross-environment compatibility.
+      </description>
+      <functions>
+        <function name="show_toast_notification">Primary dispatcher attempting WinRT first, falling back to PowerShell.</function>
+        <function name="show_winrt_toast">Constructs XML toast payload and calls ToastNotificationManager.</function>
+        <function name="show_powershell_toast">Spawns a hidden PowerShell process executing WinRT notification commands.</function>
+      </functions>
+    </module>
+
+    <module file="src/ui/mod.rs">
+      <role>Application Layout and Main Navigation Loop</role>
+      <description>
+        Implements eframe::App. Renders the fixed-width 196px left sidebar with tab buttons, top navigation bar showing
+        net worth across cards and live system date, system notices banner, and delegates central content to the active tab view.
+      </description>
+      <types>
+        <type name="AppTab">Enum representing the 3 main views: Accounts, Subscriptions, SavingsPlans.</type>
+        <type name="SavingsTrackerApp">Root application state holding active tab, view states, storage, and notice queue.</type>
+      </types>
+    </module>
+
+    <module file="src/ui/theme.rs">
+      <role>Design System, Color Palette, and Formatting Helpers</role>
+      <description>
+        Centralized design tokens matching approved dark palette (#11141A background, #171B23 panels, #6C7CF0 accent,
+        #3FCDA8 income, #F2726B expense). Provides font builders and PKR currency formatters with thousands separators.
+      </description>
+      <constants>
+        <constant name="BG">Primary background color (#11141A)</constant>
+        <constant name="PANEL">Container and card background color (#171B23)</constant>
+        <constant name="PANEL2">Sub-container and hover background color (#1C212B)</constant>
+        <constant name="BORDER">Subtle container stroke border color (#242938)</constant>
+        <constant name="ACCENT">Vibrant indigo accent color (#6C7CF0)</constant>
+        <constant name="IN">Positive cash flow emerald green (#3FCDA8)</constant>
+        <constant name="OUT">Negative cash flow coral red (#F2726B)</constant>
+        <constant name="CARD_GAP">Shared vertical and horizontal gap between cards and pills (16px)</constant>
+        <constant name="CARD_PADDING">Shared internal card padding (18px)</constant>
+        <constant name="CONTENT_MAX_WIDTH">Maximum content width for centered card stacks (900px)</constant>
+        <constant name="PAGE_MARGIN">Universal outer horizontal page margin (24px)</constant>
+      </constants>
+      <methods>
+        <method name="format_pkr">Formats monetary amounts with thousands commas and 2 decimal places (e.g., Rs 12,500.00).</method>
+        <method name="format_pkr_whole">Formats monetary amounts with thousands commas rounded to whole rupees (e.g., Rs 12,500).</method>
+        <method name="parse_pkr_input">Parses user-entered currency strings by stripping thousands commas and whitespace into Option&lt;f64&gt;.</method>
+        <method name="render_mono">Renders text using tabular monospaced IBM Plex Mono font for aligned figures.</method>
+      </methods>
+    </module>
+
+    <module file="src/ui/accounts.rs">
+      <role>Bank Accounts View Controller</role>
+      <description>
+        Renders card selection pills, single-row summary card stats (running balance, monthly income, monthly expenses, opening balance),
+        toolbar with quick transaction add buttons, period filters, search bar, and egui_extras TableBuilder transaction spreadsheet.
+        Supports editing opening balance amount, description, and date via dedicated modal.
+      </description>
+      <structs>
+        <struct name="AccountsViewState">UI state for selected card, date filters, search input, modals, and pending edits.</struct>
+      </structs>
+      <functions>
+        <function name="render_accounts_view">Main rendering entry for the Bank Accounts tab.</function>
+      </functions>
+    </module>
+
+    <module file="src/ui/subscriptions_view.rs">
+      <role>Subscriptions View Controller</role>
+      <description>
+        Renders summary metrics (total monthly prorated cost, annual commitment, active vs paused count) and a single-column
+        vertical card stack with add, edit, pause, and delete subscription workflows.
+      </description>
+      <structs>
+        <struct name="SubscriptionsViewState">Modal dialog state, form fields, and pending subscription actions.</struct>
+      </structs>
+      <functions>
+        <function name="render_subscriptions_view">Main rendering entry for the Subscriptions tab.</function>
+      </functions>
+    </module>
+
+    <module file="src/ui/savings_view.rs">
+      <role>Savings Plans View Controller</role>
+      <description>
+        Renders active and archived savings plan cards in a single-column vertical stack with split stat lines, visual progress bars,
+        monthly surplus breakdowns, feasibility warnings, and modal dialogs for configuring new financial targets.
+      </description>
+      <structs>
+        <struct name="SavingsViewState">State for active/history sub-tab, creation modal, and expanded plan details.</struct>
+      </structs>
+      <functions>
+        <function name="render_savings_view">Main rendering entry for the Savings Plans tab.</function>
+      </functions>
+    </module>
+  </modules>
+
+  <testing>
+    <test_file path="tests/core_tests.rs">
+      <description>Automated test suite verifying domain logic, formatting, and mathematical guarantees.</description>
+      <tests>
+        <test name="test_currency_formatting_pkr">Verifies comma grouping, whole/decimal formatting, and parse_pkr_input for Pakistani Rupee amounts.</test>
+        <test name="test_ledger_running_balance_chronological">Verifies chronological sequencing, backdated edits, and balance math starting from opening balance.</test>
+        <test name="test_opening_balance_single_anchor_row_regression">Verifies that exactly one opening balance anchor row is synthesized for any card.</test>
+        <test name="test_subscription_cycle_advancement_and_proration">Verifies date progression and prorated monthly expense calculations.</test>
+        <test name="test_subscription_missed_due_date_catchup">Verifies automatic catchup generation for overdue recurring subscriptions.</test>
+        <test name="test_savings_plan_feasibility_and_calculations">Verifies feasibility detection when targets exceed monthly income.</test>
+        <test name="test_savings_plan_progress_and_surplus_tracking">Verifies monthly spending against limits and net surplus calculation.</test>
+        <test name="test_storage_atomic_save_and_load">Verifies atomic disk writes, temp file cleanup, and data recovery.</test>
+        <test name="test_font_loading_and_layout">Verifies custom font families, glyph availability, and table layout generation.</test>
+        <test name="test_checklist_requirements_integration">End-to-end integration test verifying opening balance persistence, backdating, and comma parsing.</test>
+      </tests>
+    </test_file>
+  </testing>
+
+  <build_and_release>
+    <commands>
+      <command type="development">cargo run</command>
+      <command type="testing">cargo test</command>
+      <command type="release">cargo build --release</command>
+    </commands>
+    <release_profile_optimizations>
+      <opt level="3">Highest compiler optimization level</opt>
+      <lto>true</lto>
+      <codegen_units>1</codegen_units>
+      <panic>abort</panic>
+      <strip>true</strip>
+    </release_profile_optimizations>
+  </build_and_release>
+</codebase>

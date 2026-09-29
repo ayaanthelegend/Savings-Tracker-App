@@ -1,0 +1,29 @@
+accounts.rs:133: U+2605 (★) -> "★ ",
+accounts.rs:278: U+00B7 (·), U+2605 (★) -> let badge_text = "★ Primary · Earning account";
+accounts.rs:355: U+2715 (✕) -> if ui.small_button("✕").clicked() {
+accounts.rs:362: U+270E (✎) -> if ui.small_button("✎").clicked() {
+accounts.rs:527: U+2026 (…) -> .hint_text("Search transactions…"),
+accounts.rs:598: U+2014 (—) -> ui.label(RichText::new("—").font(Theme::font_sans(12.5)).ita
+accounts.rs:601: U+2014 (—) -> ui.label(RichText::new("—").font(Theme::font_mono(13.0)).col
+accounts.rs:604: U+2014 (—) -> ui.label(RichText::new("—").font(Theme::font_mono(13.0)).col
+accounts.rs:633: U+2014 (—) -> ui.label(RichText::new("—").font(Theme::font_mono(13.0)).col
+accounts.rs:641: U+2014 (—) -> ui.label(RichText::new("—").font(Theme::font_mono(13.0)).col
+accounts.rs:818: U+1F7E2 (🟢) -> if ui.selectable_label(state.tx_is_income, RichText::new("🟢 
+accounts.rs:824: U+1F534 (🔴) -> if ui.selectable_label(!state.tx_is_income, RichText::new("🔴
+mod.rs:246: U+1F514 (🔔) -> ui.label(RichText::new("🔔 Automated:").strong().color(Theme:
+savings_view.rs:104: U+1F3AF (🎯) -> ui.label(RichText::new("🎯 Active Plans").font(Theme::font_sa
+savings_view.rs:119: U+1F4DC (📜) -> let label = if hist_count > 0 { format!("📜 History ({})", hi
+savings_view.rs:252: U+2014 (—) -> let meta_text = format!("Saved {} / {} — {:.0}%", saved_str,
+savings_view.rs:257: U+26A0 (⚠), U+FE0F (️) -> ui.label(RichText::new(format!("⚠️ Shortage Rs {:.0}/mo", ca
+savings_view.rs:409: U+1F389 (🎉) -> ui.label(RichText::new("🎉 Goal Achieved").font(Theme::font_s
+savings_view.rs:411: U+26A0 (⚠), U+FE0F (️) -> ui.label(RichText::new("⚠️ Goal Missed").font(Theme::font_sa
+savings_view.rs:439: U+2014 (—) -> let meta_text = format!("Final: {} / {} — {:.0}%", Theme::fo
+savings_view.rs:562: U+2022 (•) -> ui.label(format!("• Months remaining: {:.1} months", months_
+savings_view.rs:563: U+2022 (•) -> ui.label(format!("• Required savings / mo: {}", Theme::forma
+savings_view.rs:564: U+2022 (•) -> ui.label(format!("• Subscriptions cost: {} / mo", Theme::for
+savings_view.rs:565: U+2022 (•) -> ui.label(format!("• Recommended spending limit: {} / mo", Th
+savings_view.rs:567: U+2022 (•) -> ui.label(format!("• Active override limit: {} / mo", Theme::
+savings_view.rs:574: U+26A0 (⚠), U+FE0F (️) -> format!("⚠️ Unfeasible: Required savings exceed income by {}
+savings_view.rs:577: U+2714 (✔) -> ui.colored_label(Theme::INCOME, "✔ Feasible within your mont
+subscriptions_view.rs:149: U+25CF (●) -> ui.label(RichText::new("● Active").font(Theme::font_sans(11.
+subscriptions_view.rs:175: U+00B7 (·) -> let meta_text = format!("Bills {} · {}", card_name, due_str)
