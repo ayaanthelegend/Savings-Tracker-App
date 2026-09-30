@@ -52,6 +52,7 @@ pub struct SavingsTrackerApp {
 
     // Cloud Sync & Auth
     sync_manager: SyncManager,
+    app_data: Arc<Mutex<AppData>>,
     is_logged_in: bool,
     user_email: String,
     login_state: LoginViewState,
@@ -81,7 +82,7 @@ impl SavingsTrackerApp {
         let user_email = session.as_ref().map(|s| s.user_email.clone()).unwrap_or_default();
 
         let app_data_arc = Arc::new(Mutex::new(data.clone()));
-        let sync_manager = SyncManager::new(app_data_arc);
+        let sync_manager = SyncManager::new(Arc::clone(&app_data_arc));
 
         if is_logged_in {
             sync_manager.check_initial_sync();
@@ -90,6 +91,7 @@ impl SavingsTrackerApp {
         Self {
             storage,
             data,
+            app_data: app_data_arc,
             active_tab: AppTab::Overview,
             overview_state: OverviewViewState::default(),
             accounts_state: AccountsViewState {
@@ -117,6 +119,7 @@ impl eframe::App for SavingsTrackerApp {
             match event {
                 SyncEvent::DataMerged(new_data) => {
                     self.data = *new_data;
+                    *self.app_data.lock().unwrap() = self.data.clone();
                     let _ = self.storage.save(&self.data);
                     ctx.request_repaint();
                 }
@@ -145,8 +148,8 @@ impl eframe::App for SavingsTrackerApp {
                 // Just regained focus: immediate pull
                 self.sync_manager.trigger_pull();
                 self.last_pull_instant = Instant::now();
-            } else if is_focused && self.last_pull_instant.elapsed() >= Duration::from_secs(60) {
-                // Periodic 60s pull while window has focus
+            } else if self.last_pull_instant.elapsed() >= Duration::from_secs(300) {
+                // Periodic 5-minute pull
                 self.sync_manager.trigger_pull();
                 self.last_pull_instant = Instant::now();
             }
@@ -505,6 +508,7 @@ impl eframe::App for SavingsTrackerApp {
             if let Err(e) = self.storage.save(&self.data) {
                 eprintln!("Failed to save data locally: {}", e);
             }
+            *self.app_data.lock().unwrap() = self.data.clone();
             self.sync_manager.enqueue_push();
         }
     }

@@ -499,8 +499,11 @@ impl SyncWorker {
         if self.session.is_some() {
             self.ensure_fresh_token();
             self.do_pull();
+            self.enqueue_all_from_app_data();
             self.do_push();
         }
+
+        let mut last_periodic_sync = Instant::now();
 
         loop {
             // Process commands with short timeout
@@ -510,6 +513,7 @@ impl SyncWorker {
                     self.session = Some(session);
                     self.consecutive_failures = 0;
                     self.next_retry_at = None;
+                    last_periodic_sync = Instant::now();
                     self.do_pull();
                     self.do_push();
                 }
@@ -544,6 +548,12 @@ impl SyncWorker {
                                 self.do_push();
                             }
                         }
+                    } else if self.session.is_some() && last_periodic_sync.elapsed() >= Duration::from_secs(300) {
+                        // Automatic 5-minute background cloud sync
+                        last_periodic_sync = Instant::now();
+                        self.do_pull();
+                        self.enqueue_all_from_app_data();
+                        self.do_push();
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -551,34 +561,24 @@ impl SyncWorker {
         }
     }
 
-    /// Populates the pending queue with all items currently in local AppData whose updated_at
-    /// is greater than the last sync watermark.
+    /// Populates the pending queue with all items currently in local AppData
+    /// so they can be upserted to Supabase.
     fn enqueue_all_from_app_data(&mut self) {
         let data = self.app_data.lock().unwrap().clone();
         for c in &data.cards {
-            if self.watermarks.cards.map_or(true, |wm| c.updated_at > wm) {
-                self.pending_queue.cards.insert(c.id);
-            }
-        }
-        for t in &data.transactions {
-            if self.watermarks.transactions.map_or(true, |wm| t.updated_at > wm) {
-                self.pending_queue.transactions.insert(t.id);
-            }
-        }
-        for s in &data.subscriptions {
-            if self.watermarks.subscriptions.map_or(true, |wm| s.updated_at > wm) {
-                self.pending_queue.subscriptions.insert(s.id);
-            }
-        }
-        for p in &data.plans {
-            if self.watermarks.savings_plans.map_or(true, |wm| p.updated_at > wm) {
-                self.pending_queue.savings_plans.insert(p.id);
-            }
+            self.pending_queue.cards.insert(c.id);
         }
         for cat in &data.categories {
-            if self.watermarks.categories.map_or(true, |wm| cat.updated_at > wm) {
-                self.pending_queue.categories.insert(cat.id);
-            }
+            self.pending_queue.categories.insert(cat.id);
+        }
+        for s in &data.subscriptions {
+            self.pending_queue.subscriptions.insert(s.id);
+        }
+        for p in &data.plans {
+            self.pending_queue.savings_plans.insert(p.id);
+        }
+        for t in &data.transactions {
+            self.pending_queue.transactions.insert(t.id);
         }
         let _ = self.pending_queue.save();
     }
@@ -672,6 +672,8 @@ impl SyncWorker {
                     // Cloud has data: clear watermarks and pull all
                     self.watermarks = SyncWatermarks::default();
                     self.do_pull();
+                    self.enqueue_all_from_app_data();
+                    self.do_push();
                 }
             }
             Err(e) => {
@@ -717,9 +719,8 @@ impl SyncWorker {
 
             if !rows.is_empty() {
                 match self.push_table::<CardRow>(&base_url, &anon_key, &session.access_token, "cards", &rows) {
-                    Ok(max_updated) => {
+                    Ok(_) => {
                         self.pending_queue.cards.clear();
-                        self.watermarks.cards = Some(max_updated.max(self.watermarks.cards.unwrap_or(max_updated)));
                         any_push_succeeded = true;
                     }
                     Err(e) => {
@@ -743,9 +744,8 @@ impl SyncWorker {
 
             if !rows.is_empty() {
                 match self.push_table::<CategoryRow>(&base_url, &anon_key, &session.access_token, "categories", &rows) {
-                    Ok(max_updated) => {
+                    Ok(_) => {
                         self.pending_queue.categories.clear();
-                        self.watermarks.categories = Some(max_updated.max(self.watermarks.categories.unwrap_or(max_updated)));
                         any_push_succeeded = true;
                     }
                     Err(e) => {
@@ -769,9 +769,8 @@ impl SyncWorker {
 
             if !rows.is_empty() {
                 match self.push_table::<SavingsPlanRow>(&base_url, &anon_key, &session.access_token, "savings_plans", &rows) {
-                    Ok(max_updated) => {
+                    Ok(_) => {
                         self.pending_queue.savings_plans.clear();
-                        self.watermarks.savings_plans = Some(max_updated.max(self.watermarks.savings_plans.unwrap_or(max_updated)));
                         any_push_succeeded = true;
                     }
                     Err(e) => {
@@ -795,9 +794,8 @@ impl SyncWorker {
 
             if !rows.is_empty() {
                 match self.push_table::<SubscriptionRow>(&base_url, &anon_key, &session.access_token, "subscriptions", &rows) {
-                    Ok(max_updated) => {
+                    Ok(_) => {
                         self.pending_queue.subscriptions.clear();
-                        self.watermarks.subscriptions = Some(max_updated.max(self.watermarks.subscriptions.unwrap_or(max_updated)));
                         any_push_succeeded = true;
                     }
                     Err(e) => {
@@ -821,9 +819,8 @@ impl SyncWorker {
 
             if !rows.is_empty() {
                 match self.push_table::<TransactionRow>(&base_url, &anon_key, &session.access_token, "transactions", &rows) {
-                    Ok(max_updated) => {
+                    Ok(_) => {
                         self.pending_queue.transactions.clear();
-                        self.watermarks.transactions = Some(max_updated.max(self.watermarks.transactions.unwrap_or(max_updated)));
                         any_push_succeeded = true;
                     }
                     Err(e) => {
@@ -837,7 +834,6 @@ impl SyncWorker {
         }
 
         let _ = self.pending_queue.save();
-        let _ = self.watermarks.save();
 
         if any_push_failed {
             self.consecutive_failures += 1;
@@ -1047,8 +1043,8 @@ impl SyncWorker {
     ) -> Result<(Vec<T>, Option<DateTime<Utc>>)> {
         let mut endpoint = format!("{}/rest/v1/{}?select=*&order=updated_at.asc", base_url, table_name);
         if let Some(wm) = watermark {
-            let rfc3339 = wm.to_rfc3339();
-            endpoint.push_str(&format!("&updated_at=gt.{}", rfc3339));
+            let iso_z = wm.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+            endpoint.push_str(&format!("&updated_at=gt.{}", iso_z));
         }
 
         let resp = self

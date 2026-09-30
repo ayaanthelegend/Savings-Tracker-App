@@ -81,23 +81,7 @@ export const App: React.FC = () => {
       const localPlans = await getAllSavingsPlans();
       const localCats = await getAllCategories();
 
-      // Seed defaults if brand new local DB
-      if (localCards.length === 0) {
-        const defaultCardId = generateUuid();
-        const defaultCard: Card = {
-          id: defaultCardId,
-          name: "Main Card",
-          is_primary: true,
-          opening_balance: 0,
-          opening_balance_description: "Opening Balance",
-          opening_balance_date: null,
-          updated_at: new Date().toISOString(),
-          deleted_at: null,
-        };
-        await putCard(defaultCard, true);
-        localCards.push(defaultCard);
-      }
-
+      // Categories fallback
       if (localCats.length === 0) {
         const defaultCategoryNames = ["Food", "Income", "Subscription", "Transport", "Shopping", "Other"];
         for (const name of defaultCategoryNames) {
@@ -108,7 +92,7 @@ export const App: React.FC = () => {
             updated_at: new Date().toISOString(),
             deleted_at: null,
           };
-          await putCategory(cat, true);
+          await putCategory(cat, false);
           localCats.push(cat);
         }
       }
@@ -174,12 +158,12 @@ export const App: React.FC = () => {
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
 
-    // Auto-sync every 60s while tab/app is open
+    // Auto-sync every 5 minutes while tab/app is open
     const interval = setInterval(() => {
       if (document.visibilityState === "visible") {
         triggerSync();
       }
-    }, 60000);
+    }, 5 * 60 * 1000);
 
     return () => {
       window.removeEventListener("online", handleOnline);

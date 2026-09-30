@@ -126,6 +126,23 @@ export async function performSync(userId: string): Promise<SyncResult> {
         if (maxUpdated) {
           await setWatermark(table, maxUpdated);
         }
+
+        // Clean up any local placeholder cards that have no transactions and do not exist on server
+        if (table === "cards") {
+          const allLocalCards = await db.getAll("cards");
+          const serverCards = await supabase.from("cards").select("id");
+          if (serverCards.data && serverCards.data.length > 0) {
+            const serverCardIds = new Set(serverCards.data.map((c: any) => c.id));
+            for (const lc of allLocalCards) {
+              if (!serverCardIds.has(lc.id) && lc.opening_balance === 0) {
+                const txs = await db.getAllFromIndex("transactions", "by-card", lc.id);
+                if (txs.length === 0) {
+                  await db.delete("cards", lc.id);
+                }
+              }
+            }
+          }
+        }
       }
     }
 
